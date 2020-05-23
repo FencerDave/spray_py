@@ -1,4 +1,4 @@
-# spray_py
+# Spray Dry with spray_py !
 Physics-Based Spray Dryer model, to help tune parameters and guide spray dryer design
 Started from a droplet heat model I made for Chad Curtis' University of Washington Chemical Engineering Graduate Mathematics class.
 

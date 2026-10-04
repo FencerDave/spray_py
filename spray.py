@@ -32,6 +32,8 @@ The third stage , the final one considered but not finished in that
                                     VERY complicated and swirley! )
 
 Other things to consider for future work: 
+    * Heat transfer coefficient as f(n) of physics instead of placeholder
+    * Airstream calculations for more complicated Temp profile (also humidity?)
     * Building a library of materials / recipes to spray
     * Learning about pneumatic dust conveyance for particle handling
     * Other changes inside particles? (Hollow sphere results?)
@@ -62,6 +64,20 @@ class to take the recipe and put it into the spray dryer? I totally don't know.'
 In any case, I'll function-alize what I can and convert the existing into 
 tests to run it.... 
 """
+import numpy as np
+import matplotlib.pyplot as plt
+plt.close("all") #Get rid of plots from last run of program
+#import scipy as sp
+
+#Use this to report better values
+from math import log10, floor
+def round_2(x): return round(x, 2-int(floor(log10(abs(x)))))
+
+"""
+Using DataClasses 
+
+ * 
+"""
 
 
 
@@ -80,14 +96,6 @@ tests to run it....
 ---A--A--A----
 --A-------A---
 """
-import numpy as np
-import matplotlib.pyplot as plt
-plt.close("all") #Get rid of plots from last run of program
-import scipy as sp
-
-#Use this to report better values
-from math import log10, floor
-def round_2(x): return round(x, 2-int(floor(log10(abs(x)))))
 
 #Describe the Droplet
 R=300*10**(-6) # Droplet Radius, meters (eg. 500 microns)
@@ -182,7 +190,7 @@ ax.set_xlabel("Radius (Microns)")
 ax.set_title("Heating with T="+str(round(Ti-273.16))+'*C   Biot='+str(round_2(Biot)))
 ax.axhspan(125, 175, alpha=0.1, color='black')
 for i,T in enumerate(Plot_T):    
-    ax.plot(r_vals*10**6,Plots[i,:]-273.15)
+    ax.plot(r_vals*10**6, Plots[i,:]-273.15)
 
 
 
@@ -581,6 +589,7 @@ HVap=2256.4     # J/g to Evaporate water. NOTE: is 500x the Q for 1K dT - more t
 T0=25  + 273.16 #K, Initial Temperature of water (Constant at all points)
 
 time=0.5 # Seconds in the spray dryer (max time to solve for)
+dr=10*10**(-6) # dr value, in meters (10 microns, 100 points)
 dtime=dr*10      # dt value, in seconds (0.1 milisecond) Not used?
 t_vals=[] #New Idea. Fix delta T (at the surface), and simply RECORD the time of each step!
 
@@ -589,7 +598,6 @@ Titles_To_Output_T=[]
 Rs_To_Output_T=[]
 tcount_Out=[]
 for Ti in T_Settings:
-    dr=10*10**(-6) # dr value, in meters (10 microns, 100 points)
     r_vals=np.arange(0,R+dr,dr)
     A_Vals=4*np.pi*r_vals**2 #Area of the shell at r 
     V_Vals=r_vals*0

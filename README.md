@@ -13,7 +13,7 @@ Similarly, there are several use-cases and purposes that will process and use da
 
 
 
-\[Actual Spray Dryer @ Aquion Energy 2019, Spray Dryer Inputs, Droplet Energy Shell-Balance](/images/Combined\_Diagram.png)
+![Actual Spray Dryer @ Aquion Energy 2019, Spray Dryer Inputs, Droplet Energy Shell-Balance](/images/Combined_Diagram.png)
 
 
 

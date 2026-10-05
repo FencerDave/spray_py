@@ -16,19 +16,35 @@ def round_2(x): return round(x, 2-int(floor(log10(abs(x)))))
 
 
 """
+NOTE ON UNITS: 
+    USING M-G-S Units, so METERS for length scales (not sure why but that's what I have)
+                          GRAMS for mass scales
+                          JOULES for heat
+                          SECONDS for time
+                          CELCIUS for temperature (checked. No need for Kelvin)
+                          
+
+
 DATA CLASSES TO INITIALIZE
  * Universe     : Constants to use? Ideal gas law? IDK
  * InletAir     : Properties, mostly temperature and humidity of the inlet airstream
  * SlurryData   : solids content, heat capacity, etc of the input slurry
  * SprayDryer   : geometry of the spray dryer, determiness temperature profile
- * SprayDroplet : initial droplet size + velocity... Anything else?
+                     # ALSO initial droplet size + velocity... The Spray Arm
+NORMAL CLASS: SprayDroplet
+ * __init__     : Initialize droplet... With or without pre-determined history?
+ * iterate      : Take an external heat(power) value and dtime step and update
+                     # across the entire droplet one step...
+ * setup_history: Optional set up to initialize the history tables? 
+ * record_history:Record the current droplet state in the history dataframe(s)?
+ 
+ 
  
  Q: Where to put the dtime and dradius modeling parameters? 
      too small and it takes too long to solve, too big and models fuck up. 
  
 """
 @dataclass 
-
 class InletAir: 
     inletTemp: float = 300.0  # Temp, *C--> K
     heatTransferH: float = 1000 # Watts / m2 k Convective Heat Transfer 
@@ -41,6 +57,7 @@ class InletAir:
         # This can determine heat transfer things... NOT USED YET
     heatCapacity: float = 1.005 # J / g K (Also not used yet? Will determine outlet condition...)
 
+@dataclass 
 class SlurryData: 
     # (mostly?) NOT CURRENTLY USED: Chemical Information... Future work to use
     #                   recipe to calculate/estimate the rest of the parameters
@@ -63,7 +80,7 @@ class SlurryData:
     dry_internalTemp: float = 125.0 # degC TEMPERATURE GOAL for R=0 to determine "fully dried" (for pass/fail criteria)
     
 
-    
+@dataclass 
 class SprayDryer:
     # Mostly unused for physical geometry, but this all sets up the residence
     #       time and temperature profile in the model... TBD...
@@ -79,23 +96,257 @@ class SprayDryer:
     # okay now the ones currently in use...
     dwellTime: float = 2.0  # seconds to model before the particle has left
     #                           the dryer and will no longer heat up. 
+    #                           OPTIONAL NAN? Keep going until droplet reaches 
+    #                               internal T = 95% of External Temp? (Until
+    #                               other definition of "steady state"?) 
     dtime: float = 10.0**-5  # seconds per Q Solve... currently 0.01 mSecond?
     #                           (This is a model param not mechanical LOL) 
     sprayType: str = "Constant" # FLOW TYPE. THIS IMPACTS THE TEMPERATURE PROFILE
             # SprayType Options are Constant, CoCurrent, CounterCurrent?
             # CONSTANT just simplifies and keeps the Air Temp CONSTANT until we
             # develop better profiles. 
-    
-    
-    
-class SprayDroplet:
-    # Actually set up the droplet that we will study! 
     dropR = 300 * 10 ** -6  # Radius, meters (eg 300 microns)
     dRadius = 10.0**-6      # Model Solving dR Pixel Unit (1 Micron?)
-    flowRate = 0.1          # kg per minute total in dryer, for temperature profile,
+    flowRate = 100.0        # g per minute total in dryer, for temperature profile,
     dropVelocity = 10.0     # m/sec initial velocity (also for thermal profile? IDK)
     
     
+# REAL CLASS therefore needs _init_ and other functions?     
+class SprayDroplet: # OR Spray-Arm, if not wrapping into the dryer?
+    # Actually set up the droplet that we will study! 
+    # HMM maybe this should be in the Spray Dryer section since these are 
+    #   actually parameters of the Spraying Mechanics! 
+    # THE DROPLET should be the Complicated Class that has all of the model 
+    #             parameters inside of it. (So maybe I pass the dR to it? )
+    def __init__(self, Slurry: SlurryData, Dryer=SprayDryer, dR:float=10**-6):
+        """
+        Initialize a Droplet
+         * INPUT slurry parameters (wet physical properties, solidsPct, initial Temp)
+         * INPUT droplet size (Eventually from Sprayer Setup)
+         * INPUT droplet dRadius for model solve 
+         #          (Default 0.1um OR default to 0.1% of radius for 1k pts??)
+         
+         * Output X-Axis (Raidius Array)
+         * OUTPUT initial Temperature Array
+         * Output initial Moisture Content Array (or solids content damnit... Decide)
+         * Output Zeroes dT slope Array (future Q: Avg or Right-side?)
+                                     # EULER or Reverse-Euler or TriDiagonal??
+         * Output Wet (initial) Inlet/Outlet Conductivity arrays? (of each Voxel, J/k)
+                                     # Either explicit or as one (In/Out differ by dr)
+         * Output Wet (initial) Heat Capacity array (of each Voxel, J/k)
+         * Output Wet (initial) Heat of Vapor array (of each Voxel, J per _%mc?_ Unit?)
+         * Output WARNINGS / TARGETS (inherited from Slurry Recipe?)
+         OUTPUT AS A CLASS OF DROPLET with THOSE ARRAYS... (Dataframe or just list?)
+        """
+        #---GEOMETRY-----------------------------------------------------------
+        self.r_vals = np.arange(0, Dryer.dropR - dR, dR) # Radius Axis
+        #   Each VOXEL is idenfified above then by its LOWER r value.
+        #       Thus the voxel area and volume calcs are from R to R+dR
+        #       This is why the maximum r is (R-dR)... REMEMBER THAT! 
+        self.a_lower = 4*np.pi()*self.r_vals**2 # Heat Flux LOWER
+        self.a_upper = 4*np.pi()*self.r_vals**2 # Heat Flux UPPER
+        self.v_voxel = (4/3*np.pi()*(self.r_vals+dR)**3) - (4/3*np.pi()*self.r_vals**3)
+        #       Voxel volume is V of outer shell minus V of inner shell
+        self.m_voxel = self.v_voxel * Slurry.wet_rho # g = m3 *g/m3
+        #---CHEMISTRY----------------------------------------------------------
+        self.solidsPct = np.ones_like(self.r_vals) * Slurry.solidsPct
+        self.isDry = np.round(self.solidsPct,0)     # Binary for Solids==1
+        self.k_lower = self.a_lower * Slurry.wet_condK   # W/k = W/m2K * m2(Lower)
+        self.k_upper = self.a_upper * Slurry.wet_condK   # W/k = W/m2K * m2(Upper)
+        self.Cp_voxel = self.m_voxel * Slurry.wet_Cp      # J/k = J/gK * g 
+        self.Hvap_vox = self.m_voxel * (1-self.solidsPct) * Slurry.vapQ   
+        #       J = J/g * g_WET
+        #---THERMAL------------------------------------------------------------
+        self.T_degC = np.ones_like(self.r_vals) * Slurry.initTemp
+        self.dT_upper = np.zeros_like(self.r_vals)   # T vs r+dR (Positive)
+        self.dT_lower = np.zeros_like(self.r_vals)   # T vs r-dR (Negative, 0 at center)
+        self.dQdt_upper = self.dT_upper * self.k_upper    # W = W/k * dK(upper)
+        self.dQdt_lower = self.dT_lower * self.k_lower    # W = W/k * dK(lower)
+        self.dQdt_net = self.dQdt_upper + self.dQdt_lower # (W = W_in - W_out)
+        self.dQdt_dTemp = np.zeros_like(self.r_vals)      # Eventually, residual of HVap
+        self.deltaT = self.dQdt_dTemp / self.Cp_voxel     # dT = Q/Cp | dK = J / (J/K)
+        return self
+        
+    def iterate(self,ConvectionWatts, dtime:float=10**-7):
+        """
+        Iterate a Droplet:
+         * INPUT Droplet Parameters (Listed Above)
+         * INPUT dtime (turns Watts into Joules)
+         * INPUT External Heat (Watt or Joules) from Convection?
+         * CALCULATE Inlet Heat (Cond or External per voxel)
+         * CALCULATE Outlet Heat (Cond or Zero per voxel)
+         * CALCUALTE Moisture Loss (If TBoil is reached and not Dry)
+         * CALCULATE Temperature Rise (If not TBoil or YesDry)
+                 # EVENTUALLY move away from Forward-EULER? 
+                 # EVENTUAL ACCURACY - Evap and dT could be smoothed towards reality
+         * UPDATE Temperature, Moisture Content
+         * UPDATE Conductivity, Heat Capacity based on new Moisture 
+         * OUTPUT Droplet Parameters
+         * OUTPUT Warnings/ Target Flags (Over TMax, or Reached T-target@R0, etc?)
+        """
+        dQ_outer = dtime * ConvectionWatts # Watts * seconds = Joules
+        
+        # Update dT Upper and Lower values.
+        for i in range(len(self.r_vals)):
+            if i==0: #CASE Central Data point. dV lower = 0
+                self.dT_upper[i] = self.T_degC[i] - self.T_degC[i+1]
+                self.dT_lower[i] = 0 # Sphere Symmatry Boundary Cond. 
+            elif i==len(self.r_vals): #CASE External Data point
+                self.dT_upper[i] = 0 # Will Overwrite with Convective heat?
+                self.dT_lower[i] = self.T_degC[i-1] - self.T_degC[i]
+            else:
+                self.dT_upper[i] = self.T_degC[i] - self.T_degC[i+1]
+    
+        # Calculate Heat Flux
+        self.dQdt_upper = self.dT_upper * self.k_upper    # W = W/k * dK(upper)
+        self.dQdt_lower = self.dT_lower * self.k_lower    # W = W/k * dK(lower)
+        self.dQdt_net = self.dQdt_upper + self.dQdt_lower # (W = W_in - W_out)
+        #Assign net Q to Vaporization and/or Thermal rise
+        for i in range(len(self.r_vals)):
+            """
+            Check Solids content and Temperature. (Discuss edge-case of time step with BOTH dT and boiling?)
+             * Solids >= 1 : DRY. ALL Q goes to dT
+             * Temp < TVap : Wet, too cold. ALL Q goes to dT
+             * Temp>=TVap and Solids <1 : BOILING. All Q goes to Evaporation. 
+             * CURRENTLY NOT DEALING with edge case of T reaches TVap and excess goes to Qvap this step. 
+               # IF T MEANINGFULLY OVERSHOOTS, SOLVER IS TOO LOW ACCURACY ANYWAY!!! (in fact this is a useful flag...)
+            STOPPED HERE AFTER LUNCH 2026-1005
+            """
+        
+            self.deltaT = self.dQdt_dTemp / self.Cp_voxel     # dT = Q/Cp | dK = J / (J/K)
+        
+        
+                
+        
+    
+
+"""
+LIST OF FUNCTIONS TO BUILD
+
+Initialize a Droplet
+ * INPUT slurry parameters (wet physical properties, solidsPct, initial Temp)
+ * INPUT droplet size (Eventually from Sprayer Setup)
+ * INPUT droplet dRadius for model solve (OR default to 0.1% of radius for 1k pts)
+ * Output X-Axis (Raidius Array)
+ * OUTPUT initial Temperature Array
+ * Output initial Moisture Content Array (or solids content damnit... Decide)
+ * Output Zeroes dT slope Array (future Q: Avg or Right-side?)
+                             # EULER or Reverse-Euler or TriDiagonal??
+ * Output Wet (initial) Inlet/Outlet Conductivity arrays? (of each Voxel, J/k)
+                             # Either explicit or as one (In/Out differ by dr)
+ * Output Wet (initial) Heat Capacity array (of each Voxel, J/k)
+ * Output Wet (initial) Heat of Vapor array (of each Voxel, J per _%mc?_ Unit?)
+ * Output WARNINGS / TARGETS (inherited from Slurry Recipe?)
+ OUTPUT AS A CLASS OF DROPLET with THOSE ARRAYS... (Dataframe or just list?)
+
+
+
+Determine Droplet Lifetime Thermal Profile? 
+# TO INITIALIZE, CAN ALSO BE MADE VERY SIMPLIFIED: 
+    1) CONSTANT TEMPERATURE (Giant Sprayer and/or well-mixed steady state)
+    2) LINEAR TEMPERATURE INLET-->OUTLET (Rough Approx of Cocurrent)
+    3) DUAL-LINEAR or Quadratic Inlet-->Outlet (Rough Approx of CounterSpray)
+ * INPUT Overriding Assumptions (SEE ABOVE)
+ * INPUT Air Properties (Temperature, Mass/Volume Flow and Heat Capacity)
+ * INPUT Bulk Fluid Properties (Tinlet, Heat capaicty & Latent heat)
+ * INPUT Spray Dryer Properties (Direction, Flow Rate, Particle Velocity)
+ * DETERMINE if Simplified Assumptions to be used
+ * CALCULATE Residence Time Estimate (Particle Drag? Velocities and Airflow???)
+ * CALCULATE Thermal Balance (Net Adiabadic, What is T_Outlet?)
+ * OUTPUT Lookup Table for Droplet T_External (for heat flux) vs Time))
+ * OUTPUT Lookup Table for Heat Transfer Coefficients vs time?? (IDK Physics)
+
+
+Determine Droplet External Heat Transfer from Convection:
+ * INPUT Droplet External Temp at current Time (T @ R=RMax) 
+ * INPUT Airflow Temperature at current Time (from thermal Profile)
+ * INPUT Airflow Convective Coefficient at current Time? (or constant?)
+ * OUTPUT Droplet Boundary Watts per m2 (NOT JOULES so that only ITERATE has dtime Component)
+
+
+Iterate a Droplet:
+ * INPUT Droplet Parameters (Listed Above)
+ * INPUT dtime (turns Watts into Joules)
+ * INPUT External Heat (Watt or Joules) from Convection?
+ * CALCULATE Inlet Heat (Cond or External per voxel)
+ * CALCULATE Outlet Heat (Cond or Zero per voxel)
+ * CALCUALTE Moisture Loss (If TBoil is reached and not Dry)
+ * CALCULATE Temperature Rise (If not TBoil or YesDry)
+         # EVENTUALLY move away from Forward-EULER? 
+         # EVENTUAL ACCURACY - Evap and dT could be smoothed towards reality
+ * UPDATE Temperature, Moisture Content
+ * UPDATE Conductivity, Heat Capacity based on new Moisture 
+ * OUTPUT Droplet Parameters
+ * OUTPUT Warnings/ Target Flags (Over TMax, or Reached T-target@R0, etc?)
+ 
+Report Droplet Values of Note: 
+        # What are we interested in plotting??
+ * INPUT Droplet Parameters
+ * OUTPUT Droplet Mass-Averaged (or Volume-Averaged?) Temperature
+ * OUTPUT Droplet Mass-Averaged Moisture %? 
+ * OUTPUT Surface and Internal (r=R and r=0) Temperatures
+ * OUTPUT %mass Under Tmin target, and %mass Over TMax Flag??
+
+
+Initialize Data Table?:
+    # See notes on data logging below? 
+ * Input Initialized Droplet (Therefore correct length of Radius table)
+ * Input planned record Triggers/Timesteps?
+ * Output 2x2 Matrices for each parameter to record?
+ * For Record Keeping, INCLUDE a 2x2 Matrix (?) with TIME as value?. 
+
+Log Data into Table:
+     # A better simulation would turn this into matrix math and do this 
+     #      all at once. I kind of forget how to do that so my instinct is to 
+     #      just create the chart/matrix as we go? Can initialize the 2D matrices
+     #      at the beginning of a model run, or else 
+ * Input Droplet Parameters
+ * Input Current Time
+ * Input Planned Record Triggers/ Timesteps? 
+ * Input Record Matrices? Initialized elsewhere.
+ * Output Record Matrices with new line filled in...
+ 
+Log Droplet Values-of-Note into Table?
+ * INPUT finished Record Matrices
+ * RUN "Report Droplet Values of note" on each timestep in table
+ * OUTPUT Table / Dataframe with columns for Time, Tavg, Tmin, Tmax, %mc, etc.
+ 
+ Plot Thermal History: 
+ * Input Record Matrix of Temperature and Time
+ * Input Target and OverTemp flags/limits
+ * OUTPUT Plot of T-vs-R with lines for each time
+ #          Include Legend (maybe input decisions here) for time and subTime 
+ #          (such as, Bold every 10 Time-lines to count CentiSeconds?)
+ * OUTPUT Tmin and TMax box on the chart
+ #          COLOR by whether (A) T>TMin @ R=0 and/or (B) T>TMax @ at r=R
+ #              IF A & !B, SUCCESS
+ #              IF A & B, Dried but OVERHEATED - Lower Temperature
+ #              IF !A & !B, UNDERDRIED but didn't Overheat - Raise Temperature
+ #              IF !A & B, FAILURE - PSD and Dryer Mismatch! 
+ 
+ Plot Values of Note vs Time
+ * Input Values-of-note vs time
+ * OUTPUT Temperatures of note vs time
+ * OUTPUT Moisture% vs time
+ * COLORIZE "Pass" and "Fail" Times if they exist, as well as box from before.
+ 
+ 
+ 
+
+"""
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -141,8 +392,9 @@ def sprayModel(Air, Slurry, Dryer, Drop):
     for i,r in enumerate(r_vals[1:]):
         V_Vals[i+1] = 4/3*np.pi*r**3 - 4/3*np.pi*r_vals[i]**3 #Volume of the shell at r - 
         
-    # Now calculate each volume slices' enthalpy of vaporization.
+    # Now Initialize/Calculate  each volume slices' enthalpy of vaporization.
     # Wonder why i don't do this for the heat capacity of the volume slice? 
+    # I SHOULD, THIS IS GOOD AND THE FUTURE WAY TO HAVE THEM BE Variables, TOO! 
     H_Vals = V_Vals * Slurry.VapQ * Slurry.wet_rho * (1-Slurry.solidsPct)   #Joules for each volume disc to evaporate 
     
     Temps = r_vals*0 + Slurry.initTemp #Set initial Temperature profile = T0 is constant?

@@ -4,6 +4,8 @@ Created on Sun Oct  4 16:14:28 2026
 
 @author: dhooke
 """
+# %reset -f
+
 import numpy as np
 import matplotlib.pyplot as plt
 plt.close("all") #Get rid of plots from last run of program
@@ -47,7 +49,8 @@ NORMAL CLASS: SprayDroplet
 @dataclass 
 class InletAir: 
     inletTemp: float = 300.0  # Temp, *C--> K
-    heatTransferH: float = 1000 # Watts / m2 k Convective Heat Transfer 
+    heatTransferH: float = 1000 # Watts / m2 k Convective Heat Transfer
+                    # I think it's normally 1000 but changing to get it to work
     # BELOW USED TO CALCULATE THERMAL PROFILES. NOT USED YET?
     flowRate: float = 1.0     # Cubic meters per minute. NOT USED YET??
         # Medium sized spraydriers use 0.01-0.4kg/sec which is 0.5-20 m3/min
@@ -63,8 +66,8 @@ class SlurryData:
     #                   recipe to calculate/estimate the rest of the parameters
     solvent: str = "H2O"
     solids: str = "NaCl"
-    solidsPct: float = 0.00 # Solids Fraction - default is just water maybe? 
-    initTemp: 25.0          # degC inlet liquid temperature
+    solidsPct: float = 0.5 # Solids Fraction - default is just water maybe? 
+    initTemp: float = 25.0          # degC inlet liquid temperature
     # Physics of droplet under the "Wet" condition
     wet_condK: float = 0.5  # Watts*m/m2 K (Thermal conductivity, lookup default water)
     wet_Cp: float = 4.18    # J/g K (Heat Capacity, lookup default water)
@@ -75,9 +78,8 @@ class SlurryData:
     # Physics of the droplet under "Dry" conditions
     dry_condK: float = 2.5 # Watts*m/m2 K... HIGHLY VARIABLE
     dry_Cp: float = 0.80    # J/g K (Heat capacity of salt or ceramic)
-    dry_rho: float = 4.0*10**6 # Porous solids density... Actual is less by solidsPCT (Porosity)
     dry_damageTemp: float = 175.0 # DegC TEMPERATURE WHERE THINGS GET DAMAGED (for pass/fail criteria)
-    dry_internalTemp: float = 125.0 # degC TEMPERATURE GOAL for R=0 to determine "fully dried" (for pass/fail criteria)
+    dry_targetTemp: float = 125.0 # degC TEMPERATURE GOAL for R=0 to determine "fully dried" (for pass/fail criteria)
     
 
 @dataclass 
@@ -105,20 +107,19 @@ class SprayDryer:
             # SprayType Options are Constant, CoCurrent, CounterCurrent?
             # CONSTANT just simplifies and keeps the Air Temp CONSTANT until we
             # develop better profiles. 
-    dropR = 300 * 10 ** -6  # Radius, meters (eg 300 microns)
-    dRadius = 10.0**-6      # Model Solving dR Pixel Unit (1 Micron?)
-    flowRate = 100.0        # g per minute total in dryer, for temperature profile,
-    dropVelocity = 10.0     # m/sec initial velocity (also for thermal profile? IDK)
+    dropR: float = 300 * 10 ** -6  # Radius, meters (eg 300 microns)
+    dRadius: float = 10.0**-6      # Model Solving dR Pixel Unit (1 Micron?)
+    flowRate: float = 100.0        # g per minute total in dryer, for temperature profile,
+    dropVelocity: float = 10.0     # m/sec initial velocity (also for thermal profile? IDK)
     
     
 # REAL CLASS therefore needs _init_ and other functions?     
-class SprayDroplet: # OR Spray-Arm, if not wrapping into the dryer?
-    # Actually set up the droplet that we will study! 
-    # HMM maybe this should be in the Spray Dryer section since these are 
-    #   actually parameters of the Spraying Mechanics! 
-    # THE DROPLET should be the Complicated Class that has all of the model 
-    #             parameters inside of it. (So maybe I pass the dR to it? )
-    def __init__(self, Slurry: SlurryData, Dryer=SprayDryer, dR:float=10**-6):
+class SprayDroplet: 
+    '''
+    SprayDroplet: The Model itself! 
+    
+    '''
+    def __init__(self, Slurry: SlurryData, Dryer: SprayDryer, dR:float=1*10**-6):
         """
         Initialize a Droplet
          * INPUT slurry parameters (wet physical properties, solidsPct, initial Temp)
@@ -143,18 +144,31 @@ class SprayDroplet: # OR Spray-Arm, if not wrapping into the dryer?
         #   Each VOXEL is idenfified above then by its LOWER r value.
         #       Thus the voxel area and volume calcs are from R to R+dR
         #       This is why the maximum r is (R-dR)... REMEMBER THAT! 
-        self.a_lower = 4*np.pi()*self.r_vals**2 # Heat Flux LOWER
-        self.a_upper = 4*np.pi()*self.r_vals**2 # Heat Flux UPPER
-        self.v_voxel = (4/3*np.pi()*(self.r_vals+dR)**3) - (4/3*np.pi()*self.r_vals**3)
+        self.a_lower = 4*np.pi*self.r_vals**2 # Heat Flux LOWER
+        self.a_upper = 4*np.pi*(self.r_vals + dR)**2 # Heat Flux UPPER
+        self.v_voxel = (4/3*np.pi*(self.r_vals+dR)**3) - (4/3*np.pi*self.r_vals**3)
         #       Voxel volume is V of outer shell minus V of inner shell
         self.m_voxel = self.v_voxel * Slurry.wet_rho # g = m3 *g/m3
+        self.m_solid = self.m_voxel * Slurry.solidsPct 
+        self.m_liquid = self.m_voxel * (1-Slurry.solidsPct)
         #---CHEMISTRY----------------------------------------------------------
         self.solidsPct = np.ones_like(self.r_vals) * Slurry.solidsPct
-        self.isDry = np.round(self.solidsPct,0)     # Binary for Solids==1
-        self.k_lower = self.a_lower * Slurry.wet_condK   # W/k = W/m2K * m2(Lower)
-        self.k_upper = self.a_upper * Slurry.wet_condK   # W/k = W/m2K * m2(Upper)
-        self.Cp_voxel = self.m_voxel * Slurry.wet_Cp      # J/k = J/gK * g 
-        self.Hvap_vox = self.m_voxel * (1-self.solidsPct) * Slurry.vapQ   
+        self.isDry = np.floor(self.solidsPct)     # Binary for Solids==1
+        self.k_lower = self.a_lower / dR * Slurry.wet_condK   # W/k = Wm/m2K * m2(Lower) /m_dR
+        self.k_upper = self.a_upper / dR * Slurry.wet_condK   # W/k = Wm/m2K * m2(Upper) /m_dR
+        self.Cp_voxel_wet = self.m_voxel * Slurry.wet_Cp      # J/k = J/gK * g 
+        self.Cp_voxel_dry = self.m_solid * Slurry.dry_Cp      # J/k = J/gK * g 
+        self.Hvap_vox = self.m_liquid * Slurry.vapQ   # J = g_liquid * J/gLiqVap
+        self.H_dT_vox = self.Cp_voxel_wet * (Slurry.vapTemp - Slurry.initTemp) # J = J/k * dK
+        # Copying Slurry Constants for future use, including all dry params...
+        self.solidsPct_init = Slurry.solidsPct
+        self.initTemp       = Slurry.initTemp
+        self.vapQ           = Slurry.vapQ
+        self.vapTemp        = Slurry.vapTemp
+        self.dry_condK   = Slurry.dry_condK    # (remember to re-divide by dR because its Wm/m2K)
+        self.wet_condK   = Slurry.wet_condK
+        self.dry_damageTemp = Slurry.dry_damageTemp
+        self.dry_targetTemp = Slurry.dry_targetTemp
         #       J = J/g * g_WET
         #---THERMAL------------------------------------------------------------
         self.T_degC = np.ones_like(self.r_vals) * Slurry.initTemp
@@ -163,11 +177,13 @@ class SprayDroplet: # OR Spray-Arm, if not wrapping into the dryer?
         self.dQdt_upper = self.dT_upper * self.k_upper    # W = W/k * dK(upper)
         self.dQdt_lower = self.dT_lower * self.k_lower    # W = W/k * dK(lower)
         self.dQdt_net = self.dQdt_upper + self.dQdt_lower # (W = W_in - W_out)
-        self.dQdt_dTemp = np.zeros_like(self.r_vals)      # Eventually, residual of HVap
-        self.deltaT = self.dQdt_dTemp / self.Cp_voxel     # dT = Q/Cp | dK = J / (J/K)
-        return self
+        self.Qnet_vox = np.zeros_like(self.r_vals) # TRACK THE TOTAL HEAT GAINED OVER TIME
+        # STRATEGY post Claude-consult: BOOK-KEEP focuses on HEAT and then updates
+        #           Temperature & Moisture based on the current Energy in the Voxel
+        #           so now, DON'T TOUCH Hvap and H_dT, but COMPARE those to Qnet for the voxel
+        self.dR = dR       
         
-    def iterate(self,ConvectionWatts, dtime:float=10**-7):
+    def iterate(self,ConvectionWatts, dtime:float=10**-7, debug=False):
         """
         Iterate a Droplet:
          * INPUT Droplet Parameters (Listed Above)
@@ -184,24 +200,60 @@ class SprayDroplet: # OR Spray-Arm, if not wrapping into the dryer?
          * OUTPUT Droplet Parameters
          * OUTPUT Warnings/ Target Flags (Over TMax, or Reached T-target@R0, etc?)
         """
-        dQ_outer = dtime * ConvectionWatts # Watts * seconds = Joules
-        
+                
         # Update dT Upper and Lower values.
+        # Better or worse than the literal gradient to each side?? hmm... 
+        # MAY lead to some Instsability... Come back to this. 
+        self.dT_upper = np.gradient(self.T_degC)
+        self.dT_lower = -np.gradient(self.T_degC)
+        '''
         for i in range(len(self.r_vals)):
+            # Positive Slope for Upper (Gaining Heat)
+            # Negative slope for Lower (Losing Heat)
+            # IDEA: Replace ALL OF THIS with np.gradient()
+            #           (One gradient per cell, dQdt difference depends on area In/out difference)
             if i==0: #CASE Central Data point. dV lower = 0
-                self.dT_upper[i] = self.T_degC[i] - self.T_degC[i+1]
+                self.dT_upper[i] = self.T_degC[i+1] - self.T_degC[i]
                 self.dT_lower[i] = 0 # Sphere Symmatry Boundary Cond. 
-            elif i==len(self.r_vals): #CASE External Data point
+                
+            elif i==len(self.r_vals)-1: #CASE External Data point
                 self.dT_upper[i] = 0 # Will Overwrite with Convective heat?
                 self.dT_lower[i] = self.T_degC[i-1] - self.T_degC[i]
+                
             else:
-                self.dT_upper[i] = self.T_degC[i] - self.T_degC[i+1]
-    
+                self.dT_upper[i] = self.T_degC[i+1] - self.T_degC[i]
+                self.dT_lower[i] = self.T_degC[i-1] - self.T_degC[i]
+        '''
         # Calculate Heat Flux
         self.dQdt_upper = self.dT_upper * self.k_upper    # W = W/k * dK(upper)
+        self.dQdt_upper[-1] = ConvectionWatts             # Overwrite Convection dQdt
         self.dQdt_lower = self.dT_lower * self.k_lower    # W = W/k * dK(lower)
         self.dQdt_net = self.dQdt_upper + self.dQdt_lower # (W = W_in - W_out)
-        #Assign net Q to Vaporization and/or Thermal rise
+        
+        self.Qnet_vox = self.Qnet_vox + (self.dQdt_net * dt) # Q += Watts*secs
+        
+        
+        # BASED ON Q Net, Update TEMPERATURE!
+        # Interpolate Temperature where wet based on Cp wet
+        self.T_Wet = (self.Qnet_vox <= self.H_dT_vox) * (self.Qnet_vox - self.H_dT_vox) / (self.initTemp - self.vapTemp)
+        self.T_Boil = (self.Qnet_vox > self.H_dT_vox) * (self.Qnet_vox <= (self.H_dT_vox + self.Hvap_vox) ) * self.vapTemp
+        self.T_Dry = (self.Qnet_vox > self.Hvap_vox ) * (self.Qnet_vox-self.Hvap_vox -self.H_dT_vox)/self.Cp_voxel_dry
+        self.T_degC = self.T_Wet + self.T_Boil + self.T_Dry
+        
+        # IF this logic works, use same boolean math (now on Temperature?) to Reassign conductivity K values?
+        self.k_lower = ((self.T_degC > self.vapTemp) * (self.a_lower/self.dR * self.dry_condK)
+                       +(self.T_degC <= self.vapTemp) * (self.a_lower/self.dR * self.wet_condK))
+        self.k_upper = ((self.T_degC > self.vapTemp) * (self.a_upper/self.dR * self.dry_condK)
+                       +(self.T_degC <= self.vapTemp) * (self.a_upper/self.dR * self.wet_condK))
+        
+        # Calculate Report Moisture Content based on Q Net
+        self.Solids_Wet = (self.Qnet_vox <= self.H_dT_vox) * self.solidsPct_init
+        self.Solids_Boil = (self.Qnet_vox > self.H_dT_vox) * (self.Qnet_vox <=(self.H_dT_vox + self.Hvap_vox))*(
+                            (self.Qnet_vox - self.H_dT_vox-self.Hvap_vox)/(self.solidsPct_init - 1.00))
+        self.Solids_Dry = (self.Qnet_vox > self.Hvap_vox ) * 1.0
+        
+        
+        '''#Assign net Q to Vaporization and/or Thermal rise
         for i in range(len(self.r_vals)):
             """
             Check Solids content and Temperature. (Discuss edge-case of time step with BOTH dT and boiling?)
@@ -210,13 +262,132 @@ class SprayDroplet: # OR Spray-Arm, if not wrapping into the dryer?
              * Temp>=TVap and Solids <1 : BOILING. All Q goes to Evaporation. 
              * CURRENTLY NOT DEALING with edge case of T reaches TVap and excess goes to Qvap this step. 
                # IF T MEANINGFULLY OVERSHOOTS, SOLVER IS TOO LOW ACCURACY ANYWAY!!! (in fact this is a useful flag...)
-            STOPPED HERE AFTER LUNCH 2026-1005
+               # This would be the only reason to separate "dQdt_net" into dT and dRXN parts... Ignore for now!
+            
+            
+            *RATHER THAN LOOPING THROUGH... 
+              * Make a Boolean Array for "Rows where this is true"
+              * Adjust all of those rows by the amount needed? Don't Adjust anything to the others?'
             """
+            if not(self.isDry[i]) and self.T_degC[i] >= self.vapTemp:              
+                # IF Not Dry and Have reached Temperature: 
+                # Two Scenarios: 
+                    # This Heat Packet IS ENOUGH to dry it out 
+                    #       (therefore it will be DRY, AND will have Q left to gain dT)
+                    # This heat Packet IS NOT ENOUGH to dry it out
+                    #       (therefore remove Q from the HVap counter, Recalculate Solids%)
+                dQ = self.dQdt_net[i] * dtime
+                if dQ >= self.Hvap_vox[i]:
+                    # DRY THIS VOXEL! 
+                    # Subtract this Q from NET (which will still go to heating)
+                    self.isDry[i] = 1 # Affirm Now it's dry
+                    self.dQdt_dTemp[i] = self.dQdt_net[i] - self.Hvap_vox[i]/dt # W = W - dJ/dsec
+                    self.Hvap_vox[i] = 0        # No more liquid to evaporate
+                    self.m_liquid[i] = 0        # No more liquid to evaporate
+                    self.m_voxel[i] = self.m_solid[i] # No more liquid
+                    # Now Re-Assign Properties to the "DRY" Chemical Cp, K
+                    self.Cp_voxel[i] = self.m_voxel[i] * self.dry_Cp     # W/k = W/g * g
+                    self.k_lower[i] = self.a_lower[i] * self.dry_condK_dR   # W/k = W/m2K * m2(Lower)
+                    self.k_upper[i] = self.a_upper[i] * self.dry_condK_dR   # W/k = W/m2K * m2(Upper)
+                else:
+                    # Remove dQ amount of Hvap (and liquid) from the Voxel
+                    # NO MORE dQdt_net to go to heating! 
+                    # Subtract heat from Hvap and recalculate moisture%v etc
+                    self.isDry[i] = 0 # Affirm not yet dry
+                    self.Hvap_vox[i] = self.Hvap_vox[i] - dQ  
+                    self.m_liquid[i] = self.Hvap_vox[i] / self.vapQ
+                    self.m_voxel[i] = self.m_solid[i] + self.m_liquid[i]
+                    self.dQdt_dTemp[i] = 0 # No more Net Heat for dTemp
+                # Now adjust solidsPCT (to either 1 if dry or )
+                self.solidsPct[i] = self.m_solid[i] / self.m_voxel[i]
+                # OPTIONAL Here: Snap T to boiling point ()
+                self.T_degC[i] = self.vapTemp # HARD SNAP to T_VAP? (Temporary fix?)
+                # DONE the Boiling Case, and dQ Net now all goes to Heating
+                if debug: breakpoint()
+            else:
+                self.dQdt_dTemp = self.dQdt_net #IF no evaporation, all Q goes to dTemp
+            # END FOR-Loop looping through all r values 
+           
+        # NOW apply any remaining dQdt Net (Power) to become Heating
+        self.deltaT = self.dQdt_dTemp * dtime / self.Cp_voxel     # dT = Q/Cp | dK = W*sec / (J/K)    
+        #Now incriment any X values where Temperature has increased
+        self.T_degC = np.add(self.T_degC, self.deltaT).tolist()
+        #Now flag the system, for either reaching the Too-Hot external
+        #       or for reaching the target internal Temperature
+        '''
+        self.isBurnt = bool(max(self.T_degC) >= self.dry_damageTemp)
+        self.isHappy = bool(min(self.T_degC) >= self.dry_targetTemp)
+            
         
-            self.deltaT = self.dQdt_dTemp / self.Cp_voxel     # dT = Q/Cp | dK = J / (J/K)
-        
-        
+# Generate Defaults
+theAir = InletAir()
+theSlurry = SlurryData()                
+theDryer = SprayDryer()
+
+defaultDrop = SprayDroplet(theSlurry, theDryer, dR=10**-6)
+
+theDroplet = SprayDroplet(theSlurry, theDryer, dR=10**-6)
                 
+#import plotly.express as px
+import matplotlib.pyplot as plt
+#import timeit 
+#import plotly.graph_objects as go
+
+#fig = px.line(x=theDroplet.r_vals, y=theDroplet.T_degC)    
+
+dt = 5*10**-7
+N_Datapoints = 2*10**3
+N_Readouts = 50
+Trigger=round(N_Datapoints/N_Readouts)
+t_max = dt*N_Datapoints
+time=0
+debugLoopX=3
+# Loop through 2 seconds and every 0.1 seconds update the plot
+# Watts = k * W/m2K * m2
+i = 0
+fig, ax = plt.subplots(2,1, sharex=True)
+fig2, ax2 = plt.subplots(1,1, sharex=True)
+ax[0].plot(theDroplet.r_vals*10**6, theDroplet.T_degC)
+ax[1].plot(theDroplet.r_vals*10**6, theDroplet.solidsPct)
+ax2.plot(theDroplet.r_vals*10**6, theDroplet.dT_lower)
+ax2.plot(theDroplet.r_vals*10**6, theDroplet.dT_upper)
+
+while i<N_Datapoints:
+    time = time + dt
+    dTemp_outer = theAir.inletTemp - theDroplet.T_degC[-1]
+    dQdt_convection = dTemp_outer * theAir.heatTransferH * theDroplet.a_upper[-1]
+    theDroplet.iterate(dQdt_convection, dt)
+    
+    i=i+1
+    if i/Trigger == np.floor(i/Trigger): # True for 1000 but not for 1001 
+            
+        ax[0].plot(theDroplet.r_vals*10**6, theDroplet.T_degC)
+        ax[1].plot(theDroplet.r_vals*10**6, theDroplet.solidsPct)
+        ax2.plot(theDroplet.r_vals*10**6, theDroplet.dT_lower)
+        ax2.plot(theDroplet.r_vals*10**6, theDroplet.dT_upper)
+        print("time: {}/{} microsec".format(round(time*10**6),round(t_max*10**6) ))
+
+#print("Is it burnt? {}".format(theDroplet.isBurnt))
+#print("Is it fully dry? {}".format(theDroplet.isHappy))
+
+#fig2 = px.line(x=theDroplet.r_vals, y=theDroplet.T_degC)
+fig.suptitle("Thermal Profile across Raidus")
+ax[0].plot(theDroplet.r_vals*10**6, theDroplet.T_degC)
+ax[1].plot(theDroplet.r_vals*10**6, theDroplet.solidsPct)
+#ax[0].set_ylim(0,250)
+#ax[1].set_ylim(0,1.1)
+ax[0].set_ylabel("T (*C)")
+ax[1].set_ylabel("Solids %")
+ax[1].set_xlabel("Radius, um")
+
+
+ax2.plot(theDroplet.r_vals*10**6, theDroplet.dT_lower)
+ax2.plot(theDroplet.r_vals*10**6, theDroplet.dT_upper)
+
+                
+#fig.show(renderer="browser")
+#fig2.show(renderer="browser")
+#fig3.show()
         
     
 
@@ -344,152 +515,3 @@ Log Droplet Values-of-Note into Table?
 
 
 
-
-
-
-
-
-
-def sprayModel(Air, Slurry, Dryer, Drop):
-    """
-    Take a given droplet with its recipe and spray it through the spray Dryer
-    into the inlet airstream 
-
-    Parameters
-    ----------
-    inletAir : TYPE
-        DESCRIPTION.
-    slurryData : TYPE
-        DESCRIPTION.
-    sprayDryer : TYPE
-        DESCRIPTION.
-    sprayDroplet : TYPE
-        DESCRIPTION.
-
-    Returns
-    -------
-    *Series of dataframes or other matrices? where ROWS are the dR radius 
-    of the drops, and the COLUMNS are the timestamps 
-    
-    Lifetime_Temps: Dataframe of Temperature through life
-    
-    Lifetime_MC:    Dataframe of Moisture content through droplet over life
-    
-    Results:        Dictionary? of Pass/Fail and other output recommendations 
-                    for the model run. (Did we overstep TMax or Understep TMin)
-
-    """
-  
-    
-    # Biot Number: Geometric Ratio of Heat transfer on sphere Surface to Conduction inside.
-    #      Higher Biot numbers mean slower internal conductivity, worse internal gradients.
-    Biot=(Drop.dropR/3)*Air.heatTransferH/Slurry.wet_condK
-    
-    
-    # initialize Geometry from droplet radius
-    r_vals = np.arange(0, Drop.dropR + Drop.dRadius, Drop.dRadius)
-    V_Vals=r_vals*0
-    for i,r in enumerate(r_vals[1:]):
-        V_Vals[i+1] = 4/3*np.pi*r**3 - 4/3*np.pi*r_vals[i]**3 #Volume of the shell at r - 
-        
-    # Now Initialize/Calculate  each volume slices' enthalpy of vaporization.
-    # Wonder why i don't do this for the heat capacity of the volume slice? 
-    # I SHOULD, THIS IS GOOD AND THE FUTURE WAY TO HAVE THEM BE Variables, TOO! 
-    H_Vals = V_Vals * Slurry.VapQ * Slurry.wet_rho * (1-Slurry.solidsPct)   #Joules for each volume disc to evaporate 
-    
-    Temps = r_vals*0 + Slurry.initTemp #Set initial Temperature profile = T0 is constant?
-    dTdt = r_vals*0 #Initialize thermal flux?  
-    
-    
-    # NOT SURE why we're plotting things already?! 
-    fig, ax = plt.subplots(figsize=[10,4])
-    ax.set_ylim([0,200])
-    ax.set_xlim([0,300])
-    ax.set_ylabel("Temperature *C")
-    ax.set_xlabel("Radius (Microns)")
-    
-    Plot_Time=np.arange(0,20,0.01) #Plot n solutions in 0.5 seconds in equal timesteps!
-    Plots,a=np.meshgrid(r_vals, np.arange(0, Dryer.dwellTime, Dryer.dtime)) #This is how you get the data out of the loop!
-    
-    #------------------------------------------------------------------------
-    #Okay to keep this math running, take variables back out of class for now
-    Ti = Slurry.inletTemp
-    k =  Slurry.wet_condK
-    rho = Slurry.wet_rho
-    Cp = Slurry.wet_Cp
-    dt = Dryer.dtime
-    dr = Drop.dRadius
-    h = Air.heatTransferH
-    #------------------------------------------------------------------------
-    
-    p=0 # Index of temperatures to plot.
-    tcount=0 # index of time steps (loop until this reaches the end of time)
-    t=10**-15 # Initiate Time as nonzero (avoids some divide by zero errors?) 
-    
-    T_S= Temps[-1] # Temperature at end of list aka @ Interface
-    Ti_Variable = Ti #Initialize changing Temperature
-    
-    while T_S < Ti*0.95 and Temps[1]<125+273.16 and tcount<len(Plots):
-        
-        Ti_Variable+=(-abs((4*np.pi*(r**2))*(4*h)*(Ti_Variable-Temps[i])*dt)) #Looses by h/10? Rough Model parameter.
-        Plots[tcount,:]=Temps-273.16
-        tcount+=1
-        #while Temps[1]<100+273.15: #Do until 
-        T_S= Temps[-1] # Surface Temperature
-    
-        if t > Plot_Time[p]:
-            p=p+1
-            ax.plot(r_vals*10**6,Temps-273.16,label="time=" +str(round_2(t)*10**9)+"ns")
-    
-            #print(str(round_2(t)*10**3)+" milliSeconds")
-    
-        for i,r in enumerate(r_vals): #Loop through all r values to find dT/dt
-            #Calculate Q_In, Q_Out, in units of Watts (Joules per Second.)
-            #We are now trying constant time-steps again, so 
-            if r==0:
-                Q_out=0         #Boundary condition at middle - no place for that temperature to go.
-            else:
-                Q_out=(4*np.pi*(r)**2)*k*(Temps[i]-Temps[i-1])/dr    #Conduction through shell at r
-    
-            if r==max(r_vals):
-                Q_in = (4*np.pi*(r**2))*h*(Ti_Variable-Temps[i])    #Convection at edge of shell
-                
-            else:
-                Q_in = (4*np.pi*((r+dr)**2))*k*(Temps[i+1]-Temps[i])/dr #Conduciton through shell at -r
-    
-            Q = Q_in - Q_out
-    
-            V=4/3*np.pi*((r+dr)**3-(r)**3)
-            if Temps[i]>373.16 and H_Vals[i]>0: #IF boiling point and there is Enthalpy remaining to lose:
-                H_Vals[i]+= (-Q)*dt #Subtract heat from the H Vap reserve
-                dTdt[i]=0 #No temp change during evaporation
-            else:
-                dTdt[i]= (Q) / (rho*V*Cp) # K/s,   (Watts) / (g/m3 * m3 * J/gK)
-            
-            
-        if dTdt[-1]>0:
-            t = t + dt #Capture the time elapsed
-            
-        #small delta T was required for smooth startup. I think we can use faster dT steps once we're in the weeds!
-    #         if T_S>300:   # Once we pass 27 *C (Almost immediately, but still after ~100 loops)
-    #             dt=0.005
-    #         elif T_S>400: # Once we pass 127*C 
-    #             dt=0.01
-    
-        Temps = Temps + dt * dTdt # Update the temperatures with the new temperature they have recieved?
-        
-    while p<len(Plots):    
-        Plots[p,:]=Temps-273.15 #Grab final curve and fill it for the rest
-        p+=1
-    
-    
-    
-    ax.plot(r_vals*10**6,Temps-273.15,label="time=" +str(round_2(t)*10**9)+"ns")
-    ax.set_title("Heating with T="+str(round(Ti-273.16))+'*C   Biot='+str(round_2(Biot)) + '   TIME = ' + str(round_2(t))+" Seconds")
-    Plots_To_Output_T.append(Plots) #Initialize list of models
-    Titles_To_Output_T.append("Heating with T="+str(round(Ti-273.16))+'*C   Biot='+str(round_2(Biot)) + '   TIME = ' + str(round_2(t))+" Seconds")
-    Rs_To_Output_T.append(r_vals)
-    if (Temps[-1]-273.15)>175:        
-        ax.axhspan(125, 175, alpha=0.1, color='red')
-    else:
-        ax.axhspan(125, 175, alpha=0.1, color='green')

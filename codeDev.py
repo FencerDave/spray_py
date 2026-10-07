@@ -48,7 +48,7 @@ NORMAL CLASS: SprayDroplet
 """
 @dataclass 
 class InletAir: 
-    inletTemp: float = 300.0  # Temp, *C--> K
+    inletTemp: float = 400.0  # Temp, *C--> K
     heatTransferH: float = 1000 # Watts / m2 k Convective Heat Transfer
                     # I think it's normally 1000 but changing to get it to work
     # BELOW USED TO CALCULATE THERMAL PROFILES. NOT USED YET?
@@ -235,9 +235,9 @@ class SprayDroplet:
         
         # BASED ON Q Net, Update TEMPERATURE!
         # Interpolate Temperature where wet based on Cp wet
-        self.T_Wet = (self.Qnet_vox <= self.H_dT_vox) * (self.Qnet_vox - self.H_dT_vox) / (self.initTemp - self.vapTemp)
-        self.T_Boil = (self.Qnet_vox > self.H_dT_vox) * (self.Qnet_vox <= (self.H_dT_vox + self.Hvap_vox) ) * self.vapTemp
-        self.T_Dry = (self.Qnet_vox > self.Hvap_vox ) * (self.Qnet_vox-self.Hvap_vox -self.H_dT_vox)/self.Cp_voxel_dry
+        self.T_Wet = (self.Qnet_vox <= self.H_dT_vox) * (self.initTemp + self.Qnet_vox/self.Cp_voxel_wet)
+        self.T_Boil = (self.Qnet_vox > self.H_dT_vox) * (self.Qnet_vox < (self.H_dT_vox + self.Hvap_vox) ) * self.vapTemp
+        self.T_Dry = (self.Qnet_vox >= (self.H_dT_vox + self.Hvap_vox) ) * (self.vapTemp + (self.Qnet_vox-(self.H_dT_vox + self.Hvap_vox))/self.Cp_voxel_dry)
         self.T_degC = self.T_Wet + self.T_Boil + self.T_Dry
         
         # IF this logic works, use same boolean math (now on Temperature?) to Reassign conductivity K values?
@@ -251,6 +251,7 @@ class SprayDroplet:
         self.Solids_Boil = (self.Qnet_vox > self.H_dT_vox) * (self.Qnet_vox <=(self.H_dT_vox + self.Hvap_vox))*(
                             (self.Qnet_vox - self.H_dT_vox-self.Hvap_vox)/(self.solidsPct_init - 1.00))
         self.Solids_Dry = (self.Qnet_vox > self.Hvap_vox ) * 1.0
+        self.SolidsPct = self.Solids_Wet + self.Solids_Boil + self.Solids_Dry
         
         
         '''#Assign net Q to Vaporization and/or Thermal rise
@@ -315,6 +316,8 @@ class SprayDroplet:
         #Now flag the system, for either reaching the Too-Hot external
         #       or for reaching the target internal Temperature
         '''
+        self.T_degC_avg = np.average(self.T_degC, weights=self.m_voxel)
+        self.solidsPct_avg = np.average(self.solidsPct, weights = self.v_voxel)
         self.isBurnt = bool(max(self.T_degC) >= self.dry_damageTemp)
         self.isHappy = bool(min(self.T_degC) >= self.dry_targetTemp)
             
@@ -325,7 +328,7 @@ theSlurry = SlurryData()
 theDryer = SprayDryer()
 
 defaultDrop = SprayDroplet(theSlurry, theDryer, dR=10**-6)
-
+#defaultDrop.iterate(0)
 theDroplet = SprayDroplet(theSlurry, theDryer, dR=10**-6)
                 
 #import plotly.express as px
@@ -335,27 +338,38 @@ import matplotlib.pyplot as plt
 
 #fig = px.line(x=theDroplet.r_vals, y=theDroplet.T_degC)    
 
-dt = 5*10**-7
-N_Datapoints = 2*10**3
-N_Readouts = 50
+dt = 4*10**-7
+N_Datapoints = 5*10**5
+N_Readouts = 20
 Trigger=round(N_Datapoints/N_Readouts)
 t_max = dt*N_Datapoints
 time=0
-debugLoopX=3
+i_TENTHTIME = 1000
+# INITIALIZE Data vs Time arrays
+t_array = []
+arr_T_avg   = []
+arr_T_outer = []
+arr_T_midpt   = []
+
+arr_Slds_avg    = []
+arr_Slds_outer    = []
+arr_Slds_midpt    = []
+
+arr_H_convec = []
+arr_H_netOuter = []
+
 # Loop through 2 seconds and every 0.1 seconds update the plot
 # Watts = k * W/m2K * m2
 i = 0
 fig, ax = plt.subplots(2,1, sharex=True)
-fig2, ax2 = plt.subplots(1,1, sharex=True)
-ax[0].plot(theDroplet.r_vals*10**6, theDroplet.T_degC)
-ax[1].plot(theDroplet.r_vals*10**6, theDroplet.solidsPct)
-ax2.plot(theDroplet.r_vals*10**6, theDroplet.dT_lower)
-ax2.plot(theDroplet.r_vals*10**6, theDroplet.dT_upper)
+#ax[0].plot(theDroplet.r_vals*10**6, theDroplet.T_degC)
+#ax[1].plot(theDroplet.r_vals*10**6, theDroplet.solidsPct)
 
 while i<N_Datapoints:
     time = time + dt
     dTemp_outer = theAir.inletTemp - theDroplet.T_degC[-1]
     dQdt_convection = dTemp_outer * theAir.heatTransferH * theDroplet.a_upper[-1]
+    
     theDroplet.iterate(dQdt_convection, dt)
     
     i=i+1
@@ -363,9 +377,20 @@ while i<N_Datapoints:
             
         ax[0].plot(theDroplet.r_vals*10**6, theDroplet.T_degC)
         ax[1].plot(theDroplet.r_vals*10**6, theDroplet.solidsPct)
-        ax2.plot(theDroplet.r_vals*10**6, theDroplet.dT_lower)
-        ax2.plot(theDroplet.r_vals*10**6, theDroplet.dT_upper)
-        print("time: {}/{} microsec".format(round(time*10**6),round(t_max*10**6) ))
+        #ax2.plot(theDroplet.r_vals*10**6, theDroplet.dT_lower)
+        #ax2.plot(theDroplet.r_vals*10**6, theDroplet.dT_upper)
+        print("time: {}/{} u-sec. TMax = {}".format(round(time*10**6),round(t_max*10**6), round(max(theDroplet.T_degC)) ))
+        
+        t_array.append(time)
+        arr_T_avg.append(theDroplet.T_degC_avg)
+        arr_T_outer.append(theDroplet.T_degC[-1])
+        arr_T_midpt.append(theDroplet.T_degC[0])
+        arr_Slds_avg.append(theDroplet.solidsPct_avg)
+        arr_Slds_outer.append(theDroplet.solidsPct[-1])
+        arr_Slds_midpt.append(theDroplet.solidsPct[0])
+        
+        arr_H_convec.append(dQdt_convection)
+        arr_H_netOuter.append(theDroplet.dQdt_net[-1])
 
 #print("Is it burnt? {}".format(theDroplet.isBurnt))
 #print("Is it fully dry? {}".format(theDroplet.isHappy))
@@ -380,14 +405,20 @@ ax[0].set_ylabel("T (*C)")
 ax[1].set_ylabel("Solids %")
 ax[1].set_xlabel("Radius, um")
 
+fig2, ax2 = plt.subplots(3,1,sharex=True)                 
+ax2[0].plot(t_array, arr_T_avg, '-xb')                
+ax2[0].plot(t_array, arr_T_outer, '--or')             
+ax2[0].plot(t_array, arr_T_midpt, '-*k') 
+ax2[1].plot(t_array, arr_Slds_avg, '-xb')     
+ax2[1].plot(t_array, arr_Slds_outer, '--or')     
+ax2[1].plot(t_array, arr_Slds_midpt, '-*k')             
+ax2[2].plot(t_array, arr_H_convec, '-*y') 
+ax2[2].plot(t_array,  arr_H_netOuter, '--or') 
+ax2[0].set_ylabel("T (*C)")
+ax2[1].set_ylabel("Avg Solids%")
+ax2[2].set_ylabel("H(Watts)")
+ax2[2].set_xlabel("Time(sec)")
 
-ax2.plot(theDroplet.r_vals*10**6, theDroplet.dT_lower)
-ax2.plot(theDroplet.r_vals*10**6, theDroplet.dT_upper)
-
-                
-#fig.show(renderer="browser")
-#fig2.show(renderer="browser")
-#fig3.show()
         
     
 

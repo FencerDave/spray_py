@@ -10,7 +10,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 plt.close("all") #Get rid of plots from last run of program
 #import scipy as sp
+
 from dataclasses import dataclass
+import warnings 
 
 #Use this to report better values
 from math import log10, floor
@@ -50,7 +52,10 @@ NORMAL CLASS: SprayDroplet
 class InletAir: 
     inletTemp: float = 300.0  # Temp, *C--> K
     heatTransferH: float = 1000 # Watts / m2 k Convective Heat Transfer
-                    # I think it's normally 1000 but changing to get it to work
+                    # Ive historically used 1000 = a super turbulent spray dryer
+                    # Nussult Number"Nu=2" and other notes on "Stationary" 
+                    #       spheres give 100-200 for 600um Diameter, but we are
+                    #       VERY NOT STATIONARY! In any case, future physics!
     # BELOW USED TO CALCULATE THERMAL PROFILES. NOT USED YET?
     flowRate: float = 1.0     # Cubic meters per minute. NOT USED YET??
         # Medium sized spraydriers use 0.01-0.4kg/sec which is 0.5-20 m3/min
@@ -140,7 +145,7 @@ class SprayDroplet:
          OUTPUT AS A CLASS OF DROPLET with THOSE ARRAYS... (Dataframe or just list?)
         """
         #---GEOMETRY-----------------------------------------------------------
-        self.r_vals = np.arange(0, Dryer.dropR - dR, dR) # Radius Axis
+        self.r_vals = np.arange(0, Dryer.dropR, dR) # Radius Axis
         #   Each VOXEL is idenfified above then by its LOWER r value.
         #       Thus the voxel area and volume calcs are from R to R+dR
         #       This is why the maximum r is (R-dR)... REMEMBER THAT! 
@@ -152,6 +157,7 @@ class SprayDroplet:
         self.m_solid = self.m_voxel * Slurry.solidsPct 
         self.m_liquid = self.m_voxel * (1-Slurry.solidsPct)
         self.m_liquid_init = self.m_voxel * (1-Slurry.solidsPct)
+        
         #---CHEMISTRY----------------------------------------------------------
         self.solidsPct = np.ones_like(self.r_vals) * Slurry.solidsPct
         self.isDry = np.floor(self.solidsPct)     # Binary for Solids==1
@@ -179,18 +185,84 @@ class SprayDroplet:
         self.dQdt_lower = self.dT_lower * self.k_lower    # W = W/k * dK(lower)
         self.dQdt_net = self.dQdt_upper + self.dQdt_lower # (W = W_in - W_out)
         self.Qnet_vox = np.zeros_like(self.r_vals) # TRACK THE TOTAL HEAT GAINED OVER TIME
-        self.Qnet_drop = 0 #Track and compare to the sum of Qnet to identify losses
+        self.Qnet_drop = 0.0 #Track and compare to the sum of Qnet to identify losses
+        self.Age = 0.0       #ALSO Track the age rather than doing that outside of loops. 
+                                #^Especially important if we have DYNAMIC dTime ever
         # STRATEGY post Claude-consult: BOOK-KEEP focuses on HEAT and then updates
         #           Temperature & Moisture based on the current Energy in the Voxel
         #           so now, DON'T TOUCH Hvap and H_dT, but COMPARE those to Qnet for the voxel
         self.dR = dR       
         
-    def iterate(self, ConvectionWatts, dtime:float=10**-7, debug=False):
+    def _stable_dtime(self, dt_check=0, margin: float=0.0, geoAlpha: float=3.0):
+        """
+        Given a droplets current status, Use Biot and Fourier Math to estimate
+        the current minimum delta time step for the heating model to use. 
+        CALCULATE:
+            Bi_drop:    float, Biot Number with L = R/3 for sphere
+            Bi_grid:    float, Biot Number with L = dR for gridmesh
+            
+            C_sigG :    float, dt limit by VOXEL Heat capacity divided by all conductances
+                        (so [J/K]/[W/K]=[sec] even though the dK terms are different)
+                        (This dt will be worst at CENTRAL VOXEL always? since
+                         no inner conduction AND smallest heat capacity in J/K)
+                        
+        
+        INPUT:
+            dt_check:   float OR BOOL?: OPTIONAL: IF GIVEN, check this dt value
+                            against the caluclated dtime recommendation. 
+                            Flag a WARNING message if dt is NOT COMPLIANT.
+                            (Default == 0 will always pass and therefore be ignored)
+            margin:     float, Margin by which to go beyond the theoretical 
+                        literature-recommended dtime step... 
+                        dTime gets DIVIDED BY (1 + MARGIN) SO FOR INSTANCE:
+                        m = 0.00    Returns THEORETICAL LIMIT dTime
+                        m = 1       Returns dTime(th)/2
+                        m = 0.5     Returns dTime(th)/1.5
+                        m = -0.1    Returns dTime(th)/0.9 # FAILS LIMIT ON PURPOSE?
+        RETURN: 
+            dt_step:    float, recommended dTime step based on fourier limit
+                        and any additional margins given....
+                        dt_lim  = dR^2 * rho * Cp / k 
+                                = [m2][g/m3][J/gK] / [Wm/m2K]
+                        dt_step = dt_lim / geometry * (1 + margin)
+        """
+        # Calculate per-Voxel Heat Capacity (BoolMath from wet vs dry via Hnet)
+        #   This way we dont use Dry values at the center until it reaches the center. 
+        #   Dealing with BOILING HERE is a bit tricky? CP is infinite-ish since T won't change but also there is the Q associated with fully evaporating...? 
+        self.Cp_voxel = ((self.Qnet_vox <= self.H_dT_vox) * (self.Cp_voxel_wet) # IF WET, Cp Wet
+                    +(self.Qnet_vox > self.H_dT_vox) * (self.Qnet_vox < (self.H_dT_vox + self.Hvap_vox) ) * np.inf #Return HVap so its in J since K can't move until we reach HVap?
+                    + (self.Qnet_vox >= (self.H_dT_vox + self.Hvap_vox) ) * (self.Cp_voxel_dry) # IF DRY, Cp Dry
+                    )
+        
+        sigG_vox = sum(self.k_upper, self.k_lower) #Not sure this is right or makes sense... but it is a Watts per Kelvin applied to each voxel
+         #          WAIT... since the delta T is dividing by these both, it will be smaller? where these are bigger? therefore where AREA is bigger?
+         #           Oh maybe but only by R2 where the CP voxel is by R3 and therefore smallest dtime is STILL at the center! 
+            
+        dt_C_SigG = self.Cp_voxel / (geoAlpha * sigG_vox) # Ratio J/W locally and divided by Geometric "Alpha" from literature? 
+        # CITE ANY SOURCE FOR THAT? -->>>>>
+        
+        if dt_check < min(dt_C_SigG):
+            warnings.warn( "dt is LARGER than Stability Limit per Euler/Fourier",
+              category=RuntimeWarning, stacklevel=2)
+        elif dt_check <= (min(dt_C_SigG)/(1+margin)):
+            warnings.warn( "dt is Within MARGIN of theoretical Limit Eu/Bi/Fo",
+              category=RuntimeWarning, stacklevel=2)
+                
+        return min(dt_C_SigG) / (1 + margin)    
+       
+    
+    def iterate(self, ConvectionWatts, dtime:float=10**-7, 
+                dynamic_dt=False, debug=False):
         """
         Iterate a Droplet:
          * INPUT Droplet Parameters (Listed Above)
          * INPUT dtime (turns Watts into Joules)
          * INPUT External Heat (Watt or Joules) from Convection?
+         * OPTION Dynamic dtime OVERRIDE to input dtime (NEED TO MAKE IT CLEAR
+                                                         WHEN USED!!!)
+         
+         
+         
          * CALCULATE Inlet Heat (Cond or External per voxel)
          * CALCULATE Outlet Heat (Cond or Zero per voxel)
          * CALCUALTE Moisture Loss (If TBoil is reached and not Dry)
@@ -226,6 +298,18 @@ class SprayDroplet:
                 self.dT_upper[i] = self.T_degC[i+1] - self.T_degC[i]
                 self.dT_lower[i] = self.T_degC[i-1] - self.T_degC[i]
         '''
+        
+        # CHECK and/or REASSIGN delta Time value for Stability
+        if dynamic_dt:
+            # Simply calculate stable dtime and use the 0.5 margin for safety
+            dtime = self._stable_dtime(margin=0.5)
+            warnings.warn("NOTE: RE-ASSIGNING dtime inside of Model. DO NOT TRUST External Time Counters!"+
+                          "\n\t: Use SprayDroplet.Age for Trusted Time Tracking!",
+                            category=RuntimeWarning, stacklevel=2)
+        else:
+            self._stable_dtime(dt_check = dtime)
+        
+        
         # Calculate Heat Flux
         self.dQdt_Flux = self.k_upper[:-1] * (self.T_degC[1:] - self.T_degC[:-1])
         #       FLUX for an area is k_area (k*A/dr) * DeltaT
@@ -239,8 +323,10 @@ class SprayDroplet:
         self.dQdt_net[1:]   -= self.dQdt_Flux       #LOSE flux to all but bottom
         self.dQdt_net[-1]   += ConvectionWatts      #ADD Convective to top
         
-        self.Qnet_vox       += self.dQdt_net * dtime
-        self.Qnet_drop      += ConvectionWatts * dtime
+        self.Qnet_vox       += self.dQdt_net * dtime        # dJ = W * sec
+        self.Qnet_drop      += ConvectionWatts * dtime      # dJ = W * sec
+        self.Age            += dtime                        # sec = sec + sec
+        self.last_dt        = dtime # Just record this for debugging? 
         
         
         # BASED ON Q Net, Update TEMPERATURE!
@@ -280,13 +366,13 @@ theAir = InletAir()
 theSlurry = SlurryData()                
 theDryer = SprayDryer()
 
-defaultDrop = SprayDroplet(theSlurry, theDryer, dR=10**-6)
+#defaultDrop = SprayDroplet(theSlurry, theDryer, dR=10**-6)
 #defaultDrop.iterate(0)
-theDroplet = SprayDroplet(theSlurry, theDryer, dR=10**-6)
+theDroplet = SprayDroplet(theSlurry, theDryer, dR=5*10**-6)
                 
 #import plotly.express as px
 import matplotlib.pyplot as plt
-#import timeit 
+import time 
 #import plotly.graph_objects as go
 
 ''' 
@@ -301,14 +387,19 @@ INSTEAD of just guessing as I edit dt and N_datapoints...
 
  
 
-dt = 100*10**-9
-N_Datapoints = 5*10**6
+dt = 50*10**-9              # time in sec (Nanosec so long as *10**-9)
+#                           # For reference, Our Dyamic dt minimum limits 
+                            #     WET @ h=1000:  2000 *10**-9?
+                            #       DRY Worst-Case? : 53 * 10**-9?
+#N_Datapoints = 50*10**6     # millions of points. 
+t_drying = 0.25             # time in seconds
+N_Datapoints = round(t_drying/dt)
+
+
 N_Readouts = 20
-Trigger=round(N_Datapoints/N_Readouts)
-t_max = dt*N_Datapoints
-time=0
-i_TENTHTIME = 1000
-# INITIALIZE Data vs Time arrays
+t_Trigger_msec = round(1000*t_drying/N_Readouts) # milisecs to data log
+t_max = dt*N_Datapoints 
+
 t_array = []
 arr_T_avg   = []
 arr_T_outer = []
@@ -328,25 +419,48 @@ fig, ax = plt.subplots(2,1, sharex=True)
 #ax[0].plot(theDroplet.r_vals*10**6, theDroplet.T_degC)
 #ax[1].plot(theDroplet.r_vals*10**6, theDroplet.solidsPct)
 
-while i<N_Datapoints:
-    time = time + dt
+
+time_100 = 0 #Initialize clock readout...
+time_est = -666*60 #initialize... Nonsense Readings are a symbol
+while theDroplet.Age < t_drying: # Fix to track Dynamic "TRUE" Timing! 
+    
+    # As soon as we have at iterated throuh N= Number of voxels times,
+    # Time the function and use that to predict our model run time
+    R_points = len(theDroplet.r_vals)
+    if i == round(R_points):
+        time_100 = time.perf_counter()
+        # RESET Timer to readout... 
+    elif i == round (R_points + 100):
+        time_per =  (time.perf_counter() - time_100)/100.0 #Avg 100 loops?
+        time_est = N_Datapoints * time_per
+        print ("Running {} loops... Should take {} min...".format(
+            N_Datapoints, round((time_est)/60)))
+        # NOTE: Still predicting RunTime from the time-steps used at the BEGINNING
+        
+    else:
+        pass
+    
+    
     dTemp_outer = theAir.inletTemp - theDroplet.T_degC[-1]
     dQdt_convection = dTemp_outer * theAir.heatTransferH * theDroplet.a_upper[-1]
     
+    #theDroplet.iterate(dQdt_convection, dt, dynamic_dt = True)
     theDroplet.iterate(dQdt_convection, dt)
     
     i=i+1
-    if i % Trigger == 0 : # True for 1000 but not for 1001 
+    if round(theDroplet.Age*10**9) % (t_Trigger_msec*10**6) == 0 : 
+        # True where Age in mSec passes trigger time (also in mSec)
             
         ax[0].plot(theDroplet.r_vals*10**6, theDroplet.T_degC)
         ax[1].plot(theDroplet.r_vals*10**6, theDroplet.solidsPct)
         #ax2.plot(theDroplet.r_vals*10**6, theDroplet.dT_lower)
         #ax2.plot(theDroplet.r_vals*10**6, theDroplet.dT_upper)
-        print("time: {}/{} u-sec. TMax = {}  EnergyCheck: {}%".format(
-            round(time*10**6),round(t_max*10**6), round(max(theDroplet.T_degC)), 
-            round(100*sum(theDroplet.Qnet_vox)/theDroplet.Qnet_drop, 2)))
+        print("time: {}/{} m-sec. TMax = {}  EnergyCheck: {}%  Elapsed: {}/{} min".format(
+            round(theDroplet.Age*10**3),round(t_max*10**3), round(max(theDroplet.T_degC)), 
+            round(100*sum(theDroplet.Qnet_vox)/theDroplet.Qnet_drop),
+            round((time.perf_counter() - time_100)/60), round(time_est/60)))
         
-        t_array.append(time)
+        t_array.append(theDroplet.Age)
         arr_T_avg.append(theDroplet.T_degC_avg)
         arr_T_outer.append(theDroplet.T_degC[-1])
         arr_T_midpt.append(theDroplet.T_degC[0])
@@ -497,7 +611,21 @@ Log Droplet Values-of-Note into Table?
  * OUTPUT Moisture% vs time
  * COLORIZE "Pass" and "Fail" Times if they exist, as well as box from before.
  
- 
+ #---------------------------------------------------------------------------
+ #-NOTE ON MINIMUM D-TIME THEORY---------------------------------------------
+ #-----"BIOT NUMBER" - Ratio of Convective vs Radial Heat Cond.: Bi = L*h/k--
+ #-------------------- (For Shell, L ~ dR, so inherently smaller by dR/R)----
+ #---------------------------------------------------------------------------
+ #-----"FOURIER ##" - Would "Real World" heat be outpacing the time step? ---
+ #------------------- AKA "NO JUMPING OVER VOXELS!"... ----------------------
+ #--------------------- Fo = alpha * dt / dR^2-(for spherical coordinates)---
+ #----------------------@{alpha} = k / rho*Cp = [Wm/m2K] / [g/m3][J/gK]------
+ #------------------------------ = [m2/sec]----------------------------------
+ #--------------------dt must stay below ~dR2/Alpha (Thus keeping Fo < 1.0!)-
+ #------------------------------ OR geometry rules call for <0.5 or <0.333...  
+ #---------------------------------------------------------------------------
+ #---------------------------------------------------------------------------
+ #---------------------------------------------------------------------------
  
 
 """

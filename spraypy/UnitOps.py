@@ -7,8 +7,6 @@ Created on Sun Oct  4 16:14:28 2026
 # %reset -f
 
 import numpy as np
-import matplotlib.pyplot as plt
-plt.close("all") #Get rid of plots from last run of program
 #import scipy as sp
 
 from dataclasses import dataclass

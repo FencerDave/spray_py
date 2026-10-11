@@ -9,7 +9,7 @@ Started from a droplet heat model I made for Chad Curtis' University of Washingt
 
 There will be several functionalities of the model, so that it can take either experimental empirical data to generate a matching performance model, or else to generate a predictive model to guide design from first principles.
 
-Similarly, there are several use-cases and purposes that will process and use data for various inputs/outputs, such as guiding overall spray dryer design and purchasing, or improving slurry formulation to acheive a desired outcome, or even tuning control parameters to design a process control and automation setup.
+Similarly, there are several use-cases and purposes that will process and use data for various inputs/outputs, such as guiding overall spray dryer design and purchasing, or improving slurry formulation to achieve a desired outcome, or even tuning control parameters to design a process control and automation setup.
 
 
 

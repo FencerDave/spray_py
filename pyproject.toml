@@ -1,0 +1,37 @@
+[build-system]
+# How `pip install` builds the package. setuptools is the long-standing default.
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spraypy"
+version = "0.1.0"
+description = "Spray-dryer droplet model: radial heat conduction with a boiling plateau"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+# Needed to *run* the model. Keep this list short.
+dependencies = [
+    "numpy",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+# Install with:  pip install -e ".[dev]"
+dev = [
+    "pytest",
+    "pytest-cov",
+    "ruff",
+    "spyder-kernels>=2.5,<2.6",   # must match Spyder 5.5.x (Anaconda base); lets Spyder use this env
+]
+app = ["streamlit"]
+
+[tool.setuptools]
+# Only ship the spraypy package (not images/, legacy/, roadmap/, tests/).
+packages = ["spraypy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: long-running simulations (deselect with -m 'not slow')",
+]

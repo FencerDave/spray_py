@@ -121,6 +121,24 @@ class SprayDryer:
     flowRate: float = 100.0        # g per minute total in dryer, for temperature profile,
     dropVelocity: float = 10.0     # m/sec initial velocity (also for thermal profile? IDK)
     
+@dataclass
+class DropletHistory:
+    r: np.ndarray               # 1D radius axis for droplet (COLS in other arrays)
+    t: np.ndarray               # 1D actual time axis (ROWS in other arrays)
+    TdegC_profile: np.ndarray   # 2D radial Temperature vs time
+    Solid_profile: np.ndarray   # 2D radial Solids %Pct vs time
+    TdegC_avg: np.ndarray       # 1D History of Average Temperature
+    Solid_avg: np.ndarray       # 1D History of 
+    # ^Removed the "Surface" and "Midpoint" data here... 
+    #       It's just the [0] and [-1] radius levels in the existing arrays. 
+    #       A future plotter may also track the 0.25 and 0.75R points, don't make unneeded ones
+    Flux_profile: np.ndarray    # 2D radial Heat flux (Joules) IN from Upper Surface
+    dQdt_profile: np.ndarray    # 2D radial Net Heat change per time step
+    Qnet_profile: np.ndarray    # 2D radial Net Heat Accounting (Integral of dQdt)
+    # droplet history summary data points of interest
+    n_records: int
+    dt_min_used: int 
+    # def to_pd_df(self) -> pd.DataFrame: # Not sure what this entails yet?
     
 # REAL CLASS therefore needs _init_ and other functions?     
 class SprayDroplet: 
@@ -191,12 +209,12 @@ class SprayDroplet:
         #self.dQdt_net = self.dQdt_upper + self.dQdt_lower # (W = W_in - W_out)
         self.Qnet_vox = np.zeros_like(self.r_vals) # TRACK THE TOTAL HEAT GAINED OVER TIME
         self.Qnet_drop = 0.0 #Track and compare to the sum of Qnet to identify losses
+        
+        #---MODELING AND HISTORY-----------------------------------------------
         self.Age = 0.0       #ALSO Track the age rather than doing that outside of loops. 
-                                #^Especially important if we have DYNAMIC dTime ever
-        # STRATEGY post Claude-consult: BOOK-KEEP focuses on HEAT and then updates
-        #           Temperature & Moisture based on the current Energy in the Voxel
-        #           so now, DON'T TOUCH Hvap and H_dT, but COMPARE those to Qnet for the voxel
+                                #^Especially important with have DYNAMIC dTime 
         self.dR = dR       
+        self.history: DropletHistory # Empty arrays? Not sure how to initialize? 
         
     def _stable_dtime(self, dt_check=0, margin: float=0.0, geoAlpha: float=3.0,
                       dt_min = 10**-9, dt_max = 10**-6):
@@ -279,44 +297,19 @@ class SprayDroplet:
          * INPUT External Heat (Watt or Joules) from Convection?
          * OPTION Dynamic dtime OVERRIDE to input dtime (NEED TO MAKE IT CLEAR
                                                          WHEN USED!!!)
-         
-         
-         
+        
          * CALCULATE Inlet Heat (Cond or External per voxel)
          * CALCULATE Outlet Heat (Cond or Zero per voxel)
          * CALCUALTE Moisture Loss (If TBoil is reached and not Dry)
          * CALCULATE Temperature Rise (If not TBoil or YesDry)
                  # EVENTUALLY move away from Forward-EULER? 
                  # EVENTUAL ACCURACY - Evap and dT could be smoothed towards reality
+
          * UPDATE Temperature, Moisture Content
          * UPDATE Conductivity, Heat Capacity based on new Moisture 
          * OUTPUT Droplet Parameters
          * OUTPUT Warnings/ Target Flags (Over TMax, or Reached T-target@R0, etc?)
         """
-                
-        # Update dT Upper and Lower values.
-        # Better or worse than the literal gradient to each side?? hmm... 
-        # MAY lead to some Instsability... Come back to this. 
-        #self.dT_upper = np.gradient(self.T_degC)
-        #self.dT_lower = -np.gradient(self.T_degC)
-        '''
-        for i in range(len(self.r_vals)):
-            # Positive Slope for Upper (Gaining Heat)
-            # Negative slope for Lower (Losing Heat)
-            # IDEA: Replace ALL OF THIS with np.gradient()
-            #           (One gradient per cell, dQdt difference depends on area In/out difference)
-            if i==0: #CASE Central Data point. dV lower = 0
-                self.dT_upper[i] = self.T_degC[i+1] - self.T_degC[i]
-                self.dT_lower[i] = 0 # Sphere Symmatry Boundary Cond. 
-                
-            elif i==len(self.r_vals)-1: #CASE External Data point
-                self.dT_upper[i] = 0 # Will Overwrite with Convective heat?
-                self.dT_lower[i] = self.T_degC[i-1] - self.T_degC[i]
-                
-            else:
-                self.dT_upper[i] = self.T_degC[i+1] - self.T_degC[i]
-                self.dT_lower[i] = self.T_degC[i-1] - self.T_degC[i]
-        '''
         
         # CHECK and/or REASSIGN delta Time value for Stability
         if dynamic_dt:
@@ -328,7 +321,6 @@ class SprayDroplet:
         else:
             self._stable_dtime(dt_check = dtime)
         
-        
         # Calculate Heat Flux
         self.dQdt_Flux = self.k_upper[:-1] * (self.T_degC[1:] - self.T_degC[:-1])
         #       FLUX for an area is k_area (k*A/dr) * DeltaT
@@ -337,6 +329,7 @@ class SprayDroplet:
         #       Therefore flux will be ADDED to the one below (No change at top)
         #       And flux will be SUBTRACTED from the one at top (No change at bottom)
         #       Then we tack on the external convection wattage
+        # NOTE FLUX IS LENGTH N-1 THEREFORE CANT BE NAIIVELY ADDED TO RECORDS!
         self.dQdt_net        = np.zeros_like(self.T_degC)
         self.dQdt_net[:-1]  += self.dQdt_Flux       #ADD flux to all but top
         self.dQdt_net[1:]   -= self.dQdt_Flux       #LOSE flux to all but bottom
@@ -346,6 +339,7 @@ class SprayDroplet:
         self.Qnet_drop      += ConvectionWatts * dtime      # dJ = W * sec
         self.Age            += dtime                        # sec = sec + sec
         self.last_dt        = dtime # Just record this for debugging? 
+        self.last_Conv_W    = ConvectionWatts # Record convection watts 
         
         
         # BASED ON Q Net, Update TEMPERATURE!
@@ -378,133 +372,144 @@ class SprayDroplet:
         self.solidsPct_avg = np.average(self.solidsPct, weights = self.v_voxel)
         self.isBurnt = bool(max(self.T_degC) >= self.dry_damageTemp)
         self.isHappy = bool(min(self.T_degC) >= self.dry_targetTemp)
+    
+    def _init_history(self, n_records):
+        """
+        Initialize the droplet's self.history object arrays... 
+        INPUT: 
+            n_timesteps:    float, number of columns to make for timesteps. 
+                            (if too few, the write_history function will be slower?)
+        Returns
+        -------
+        self.history:       DropletHistory class object, with filled out R array
+                            and the correct 2D and 1D np.NaN arrays.
+                            
+                            
+        TdegC_profile: np.ndarray   # 2D radial Temperature vs time
+        Solid_profile: np.ndarray   # 2D radial Solids %Pct vs time
+        TdegC_avg: np.ndarray       # 1D History of Average Temperature
+        Solid_avg: np.ndarray       # 1D History of solids Pct average
+        # ^Removed the "Surface" and "Midpoint" data here... 
+        #       It's just the [0] and [-1] radius levels in the existing arrays. 
+        #       A future plotter may also track the 0.25 and 0.75R points, don't make unneeded ones
+        Flux_profile: np.ndarray    # 2D radial Heat flux (Joules) IN from UPPER Surface
+        dQdt_profile: np.ndarray    # 2D radial Net Heat change per time step
+        Qnet_profile: np.ndarray    # 2D radial Net Heat Accounting (Integral of dQdt)
+        # droplet history summary data points of interest
+        n_records: int
+        dt_min_used: int                     
+                            
+                            
+        """
+        n_vox = len(self.r_vals)
+        self.history.r              = self.r_vals                  # 1D plotting Axis: radius of voxels
+        self.history.t              = np.full(n_records, np.nan)   # 1D plotting Axis: record of timesteps
+        
+        self.history.TdegC_profile  = np.full((n_records, n_vox), np.nan)   # 2D radial Temperature vs time
+        self.history.Solid_profile  = np.full((n_records, n_vox), np.nan)   # 2D radial Solids %Pct vs time
+        self.history.TdegC_avg      = np.full(n_records, np.nan)   # 1D History of Average Temperature
+        self.history.Solid_avg      = np.full(n_records, np.nan)   # 1D History of Solids Pct
+               
+        self.history.Flux_profile   = np.full((n_records, n_vox), np.nan)    # 2D radial Heat flux (Joules) IN from Upper Surface
+        self.history.dQdt_profile   = np.full((n_records, n_vox), np.nan)    # 2D radial Net Heat change per time step
+        self.history.Qnet_profile   = np.full((n_records, n_vox), np.nan)    # 2D radial Net Heat Accounting (Integral of dQdt)
+        
+        self.history.dt_min_used    = np.full(n_records, np.nan)   # history of solver - recording dt timesteps used in simulations
+    
+    def _update_history(self, time_index=np.nan):
+        """
+        Record a row of results into the self.history object
+        
+        In a looping model, each timestep should be recorded into the NEXT time index location. 
+        
+        If time_index = nan, then search for the first index in time (history.t) that is np.NaN
+                               If there is a time[i] = np.NaN, that i is the index. 
+                               Othewise APPEND all with a new row and give a warning about that... 
+                              
+        For now, if we need to APPEND, I'm using np.append and or np.vstack'
+
+        """
+        if np.isnan(time_index):
+            #Find index i so that we overwrite the next timestamp
+            i=0
+            for index in self.history.t:
+                if np.isnan(index):
+                    break  # Stop searching, i is the index. 
+                else:
+                    i += 1 # Advance i to next. (if NO np.NAN, i will end at len+1) 
+                    
+        # Note: FLux Record is length N-1 (because it's per between-space area)
+        #   So for the RECORD, append the convection heat to the outside!
+        fluxRecord = np.append(self.dQdt_Flux, self.last_Conv_W)             
+                    
+                    
+        if i <= len(self.history.t):
+        # ^ There is probably a better way to do all this, and I'm not sure that just adding a new values at a missing index 
             
+            self.history.t[i]               = self.Age   # 1D plotting Axis: record of timesteps
+    
+            self.history.TdegC_profile[i,:] = self.T_degC        # 2D radial Temperature vs time
+            self.history.Solid_profile[i,:] = self.solidsPct     # 2D radial Solids %Pct vs time
+            self.history.TdegC_avg[i]       = self.T_degC_avg    # 1D History of Average Temperature
+            self.history.Solid_avg[i]       = self.solidsPct_avg # 1D History of Solids Pct
+            
+            self.history.Flux_profile[i,:]  = self.fluxRecord     # 2D radial Heat flux (Joules) IN from Upper Surface
+            self.history.dQdt_profile[i,:]  = self.dQdt_net      # 2D radial Net Heat change per time step
+            self.history.Qnet_profile[i,:]  = self.Qnet_vox      # 2D radial Net Heat Accounting (Integral of dQdt)
+            
+            self.history.Qnet_droplet[i]    = self.Qnet_drop     # 2D radial Net Heat Accounting (Integral of dQdt)
+            self.history.dt_min_used[i]     = self.last_dt       # 2D history of solver - recording dt timesteps used in simulations
+            
+        else: # NEED TO APPEND
+            warnings.warn("APPENDING RECORDS - Model may be Slower Due to Lack of Allocated Rows?",
+              category=RuntimeWarning, stacklevel=2)
+            self.history.t   = np.append(self.history.t, self.Age, axis=0)   # 1D plotting Axis: record of timesteps
+    
+            self.history.TdegC_profile = np.vstack(self.history.TdegC_profile, self.T_degC, axis=0)        # 2D radial Temperature vs time
+            self.history.Solid_profile = np.vstack(self.history.Solid_profile, self.solidsPct, axis=0)     # 2D radial Solids %Pct vs time
+            self.history.TdegC_avg     = np.append(self.history.TdegC_avg, self.T_degC_avg)            # 1D History of Average Temperature
+            self.history.Solid_avg     = np.append(self.history.Solid_avg, self.solidsPct_avg)         # 1D History of Solids Pct
+            
+            self.history.Flux_profile  = np.vstack(self.history.Flux_profile, fluxRecord, axis=0)         # 2D radial Heat flux (Joules) IN from Upper Surface
+            self.history.dQdt_profile  = np.vstack(self.history.dQdt_profile, self.dQdt_net, axis=0)      # 2D radial Net Heat change per time step
+            self.history.Qnet_profile  = np.vstack(self.history.Qnet_profile, self.Qnet_vox, axis=0)      # 2D radial Net Heat Accounting (Integral of dQdt)
+            
+            self.history.Qnet_droplet  = np.append(self.history.Qnet_droplet, self.Qnet_drop, axis=0)  # 1D history of droplet total Q
+            self.history.dt_min_used   = np.append(self.history.dt_min_used, self.last_dt, axis=0)     # 1D history of solver - recording dt timesteps used in simulations
+        
+        
+    def run_simulation(self, targetAge:float=1.0, deltaTime:float=50*10**-9, 
+                        dynamicTime=False, logInterval:float=0.025,
+                        otherLogging=False):
+        """
+        Adding a simplified Model Run and Data Collection scheme in order to
+        capture 
+        INPUT:
+            targetAge:  float, iterate the model until self.Age >= targetAge
+            deltaTime:  float, dt step for each chunk of time solving
+            dynamicTime:BOOL, whether or not to re-calculate time step based
+                            on the Euler and Fourier math we have done so far.
+            logInterval:float, seconds time-step on which to log a new output row
+            otherLogging:BOOL, Hard coded recommendations for logging other
+                            points of interest such as First/Last Boil, Dry, 
+                            TargetTemp, and DamageTemp, etc. 
+        
+        NOTE: NEEDS A SPRAY DRYER FOR THE INPUT AND/OR AIRFLOW
+                TO DETERMINE THE HEAT PROFILE
+        
+        ACTIONS: 
+            
+        OUTPUT:
+            runResult:  DropletHistory Class (see above?)
+                        1D labels for Radius and Time
+         
+         
+        """
+        print("Empty function for now - need Sprayer Input to proceed")
+        
+
         
 # Generate Defaults
-theAir = InletAir()
-theSlurry = SlurryData()                
-theDryer = SprayDryer(dropR= 125*10**-6)
-
-#defaultDrop = SprayDroplet(theSlurry, theDryer, dR=10**-6)
-#defaultDrop.iterate(0)
-theDroplet = SprayDroplet(theSlurry, theDryer, dR=1*10**-6)
-                
-#import plotly.express as px
-import matplotlib.pyplot as plt
-import time 
-#import plotly.graph_objects as go
-
-dt = 100*10**-9             # Model Delta-Time in sec (Nanosec so long as *10**-9)
-#                           # For reference, Our Dyamic dt minimum limits 
-                            #     WET @ h=1000:  2000 *10**-9?
-                            #     DRY Worst-Case? : 53 * 10**-9?
-#N_Datapoints = 50*10**6     # millions of points. 
-t_drying = 0.25             # time in seconds
-t_DYNAMIC_Q = True 
-
-
-N_Datapoints = round(t_drying/dt)
-N_Readouts = 20
-t_Trigger_step = t_drying / N_Readouts # milisecs to data log
-t_Trigger_next = 0
-t_max = dt*N_Datapoints 
-
-t_array = []
-arr_T_avg   = []
-arr_T_outer = []
-arr_T_midpt   = []
-
-arr_Slds_avg    = []
-arr_Slds_outer    = []
-arr_Slds_midpt    = []
-
-arr_H_convec = []
-arr_H_netOuter = []
-
-# Loop through 2 seconds and every 0.1 seconds update the plot
-# Watts = k * W/m2K * m2
-i = 0
-fig, ax = plt.subplots(2,1, sharex=True)
-#ax[0].plot(theDroplet.r_vals*10**6, theDroplet.T_degC)
-#ax[1].plot(theDroplet.r_vals*10**6, theDroplet.solidsPct)
-
-
-time_100 = 0 #Initialize clock readout...
-time_est = -666*60 #initialize... Nonsense Readings are a symbol
-while theDroplet.Age < t_drying: # Fix to track Dynamic "TRUE" Timing! 
-    
-    # As soon as we have at iterated throuh N= Number of voxels times,
-    # Time the function and use that to predict our model run time
-    R_points = len(theDroplet.r_vals)
-    if i == round(R_points):
-        time_100 = time.perf_counter()
-        # RESET Timer to readout... 
-    elif i == round (R_points + 100):
-        time_per =  (time.perf_counter() - time_100)/100.0 #Avg 100 loops?
-        time_est = N_Datapoints * time_per
-        print ("Running {} loops... Should take {} min...".format(
-            N_Datapoints, round((time_est)/60)))
-        # NOTE: Still predicting RunTime from the time-steps used at the BEGINNING
-    else:
-        pass
-    
-    dTemp_outer = theAir.inletTemp - theDroplet.T_degC[-1]
-    dQdt_convection = dTemp_outer * theAir.heatTransferH * theDroplet.a_upper[-1]
-    
-    #theDroplet.iterate(dQdt_convection, dt, dynamic_dt = True)
-    theDroplet.iterate(dQdt_convection, dt, dynamic_dt = t_DYNAMIC_Q)
-    
-    i=i+1
-    #if round(theDroplet.Age*10**9) % (t_Trigger_msec*10**6) == 0 : 
-    if theDroplet.Age > t_Trigger_next: 
-        t_Trigger_next += t_Trigger_step
-            
-        ax[0].plot(theDroplet.r_vals*10**6, theDroplet.T_degC)
-        ax[1].plot(theDroplet.r_vals*10**6, theDroplet.solidsPct)
-        #ax2.plot(theDroplet.r_vals*10**6, theDroplet.dT_lower)
-        #ax2.plot(theDroplet.r_vals*10**6, theDroplet.dT_upper)
-        print("time: {}/{} m-sec. TMax = {}  EnergyCheck: {}%  Elapsed: {}/{} min".format(
-            round(theDroplet.Age*10**3),round(t_max*10**3), round(max(theDroplet.T_degC)), 
-            round(100*sum(theDroplet.Qnet_vox)/theDroplet.Qnet_drop),
-            round((time.perf_counter() - time_100)/60), round(time_est/60)))
-        
-        t_array.append(theDroplet.Age)
-        arr_T_avg.append(theDroplet.T_degC_avg)
-        arr_T_outer.append(theDroplet.T_degC[-1])
-        arr_T_midpt.append(theDroplet.T_degC[0])
-        arr_Slds_avg.append(theDroplet.solidsPct_avg)
-        arr_Slds_outer.append(theDroplet.solidsPct[-1])
-        arr_Slds_midpt.append(theDroplet.solidsPct[0])
-        
-        arr_H_convec.append(dQdt_convection)
-        arr_H_netOuter.append(theDroplet.dQdt_net[-1])
-
-#print("Is it burnt? {}".format(theDroplet.isBurnt))
-#print("Is it fully dry? {}".format(theDroplet.isHappy))
-
-#fig2 = px.line(x=theDroplet.r_vals, y=theDroplet.T_degC)
-fig.suptitle("Thermal Profile across Raidus")
-ax[0].plot(theDroplet.r_vals*10**6, theDroplet.T_degC)
-ax[1].plot(theDroplet.r_vals*10**6, theDroplet.solidsPct)
-#ax[0].set_ylim(0,250)
-#ax[1].set_ylim(0,1.1)
-ax[0].set_ylabel("T (*C)")
-ax[1].set_ylabel("Solids %")
-ax[1].set_xlabel("Radius, um")
-
-fig2, ax2 = plt.subplots(3,1,sharex=True)                 
-ax2[0].plot(t_array, arr_T_avg, '-xb')                
-ax2[0].plot(t_array, arr_T_outer, '--or')             
-ax2[0].plot(t_array, arr_T_midpt, '-*k') 
-ax2[1].plot(t_array, arr_Slds_avg, '-xb')     
-ax2[1].plot(t_array, arr_Slds_outer, '--or')     
-ax2[1].plot(t_array, arr_Slds_midpt, '-*k')             
-ax2[2].plot(t_array, arr_H_convec, '-*y') 
-ax2[2].plot(t_array,  arr_H_netOuter, '--or') 
-ax2[0].set_ylabel("T (*C)")
-ax2[1].set_ylabel("Avg Solids%")
-ax2[2].set_ylabel("H(Watts)")
-ax2[2].set_xlabel("Time(sec)")
 
         
 """

@@ -112,8 +112,12 @@ class SprayDryer:
             # SprayType Options are Constant, CoCurrent, CounterCurrent?
             # CONSTANT just simplifies and keeps the Air Temp CONSTANT until we
             # develop better profiles. 
+    #FUTURE USE: Droplet Mechanics and STATISTICS 
     dropR: float = 300 * 10 ** -6  # Radius, meters (eg 300 microns)
-    dRadius: float = 10*10.0**-6      # Model Solving dR Pixel Unit (1 Micron? 5?)
+    dropR_sigmaDist = 2 # FUTURE USE - SPREAD of droplet Size Distribution.
+     # ^ Eventaully, Model a "Larger" and "Smaller" particle from distribution to 
+     #               check whether the largest are un-dried or the smallest are burnt!    
+     
     flowRate: float = 100.0        # g per minute total in dryer, for temperature profile,
     dropVelocity: float = 10.0     # m/sec initial velocity (also for thermal profile? IDK)
     
@@ -124,7 +128,7 @@ class SprayDroplet:
     SprayDroplet: The Model itself! 
     
     '''
-    def __init__(self, Slurry: SlurryData, Dryer: SprayDryer, dR:float=5*10**-6):
+    def __init__(self, Slurry: SlurryData, Dryer: SprayDryer, dR:float=1*10**-6):
         """
         Initialize a Droplet
          * INPUT slurry parameters (wet physical properties, solidsPct, initial Temp)
@@ -161,7 +165,8 @@ class SprayDroplet:
         #---CHEMISTRY----------------------------------------------------------
         self.solidsPct = np.ones_like(self.r_vals) * Slurry.solidsPct
         self.isDry = np.floor(self.solidsPct)     # Binary for Solids==1
-        self.k_lower = self.a_lower / dR * Slurry.wet_condK   # W/k = Wm/m2K * m2(Lower) /m_dR
+        #self.k_lower = self.a_lower / dR * Slurry.wet_condK   # W/k = Wm/m2K * m2(Lower) /m_dR
+        # Eliminated k_lower in order to only have one conduction per Area, apply to above/below as needed
         self.k_upper = self.a_upper / dR * Slurry.wet_condK   # W/k = Wm/m2K * m2(Upper) /m_dR
         self.Cp_voxel_wet = self.m_voxel * Slurry.wet_Cp      # J/k = J/gK * g 
         self.Cp_voxel_dry = self.m_solid * Slurry.dry_Cp      # J/k = J/gK * g 
@@ -181,9 +186,9 @@ class SprayDroplet:
         self.T_degC = np.ones_like(self.r_vals) * Slurry.initTemp
         self.dT_upper = np.zeros_like(self.r_vals)   # T vs r+dR (Positive)
         self.dT_lower = np.zeros_like(self.r_vals)   # T vs r-dR (Negative, 0 at center)
-        self.dQdt_upper = self.dT_upper * self.k_upper    # W = W/k * dK(upper)
-        self.dQdt_lower = self.dT_lower * self.k_lower    # W = W/k * dK(lower)
-        self.dQdt_net = self.dQdt_upper + self.dQdt_lower # (W = W_in - W_out)
+        #self.dQdt_upper = self.dT_upper * self.k_upper    # W = W/k * dK(upper)
+        #self.dQdt_lower = self.dT_lower * self.k_lower    # W = W/k * dK(lower)
+        #self.dQdt_net = self.dQdt_upper + self.dQdt_lower # (W = W_in - W_out)
         self.Qnet_vox = np.zeros_like(self.r_vals) # TRACK THE TOTAL HEAT GAINED OVER TIME
         self.Qnet_drop = 0.0 #Track and compare to the sum of Qnet to identify losses
         self.Age = 0.0       #ALSO Track the age rather than doing that outside of loops. 
@@ -193,7 +198,8 @@ class SprayDroplet:
         #           so now, DON'T TOUCH Hvap and H_dT, but COMPARE those to Qnet for the voxel
         self.dR = dR       
         
-    def _stable_dtime(self, dt_check=0, margin: float=0.0, geoAlpha: float=3.0):
+    def _stable_dtime(self, dt_check=0, margin: float=0.0, geoAlpha: float=3.0,
+                      dt_min = 10**-9, dt_max = 10**-6):
         """
         Given a droplets current status, Use Biot and Fourier Math to estimate
         the current minimum delta time step for the heating model to use. 
@@ -224,31 +230,44 @@ class SprayDroplet:
                         and any additional margins given....
                         dt_lim  = dR^2 * rho * Cp / k 
                                 = [m2][g/m3][J/gK] / [Wm/m2K]
-                        dt_step = dt_lim / geometry * (1 + margin)
+                        dt_step = dt_lim / (geometry * (1 + margin))
         """
         # Calculate per-Voxel Heat Capacity (BoolMath from wet vs dry via Hnet)
         #   This way we dont use Dry values at the center until it reaches the center. 
         #   Dealing with BOILING HERE is a bit tricky? CP is infinite-ish since T won't change but also there is the Q associated with fully evaporating...? 
-        self.Cp_voxel = ((self.Qnet_vox <= self.H_dT_vox) * (self.Cp_voxel_wet) # IF WET, Cp Wet
-                    +(self.Qnet_vox > self.H_dT_vox) * (self.Qnet_vox < (self.H_dT_vox + self.Hvap_vox) ) * np.inf #Return HVap so its in J since K can't move until we reach HVap?
-                    + (self.Qnet_vox >= (self.H_dT_vox + self.Hvap_vox) ) * (self.Cp_voxel_dry) # IF DRY, Cp Dry
-                    )
+
+        self.Cp_voxel = np.where(self.Qnet_vox <= self.H_dT_vox, self.Cp_voxel_wet,
+                        np.where(self.Qnet_vox < (self.H_dT_vox + self.Hvap_vox), np.inf, self.Cp_voxel_dry))
         
-        sigG_vox = sum(self.k_upper, self.k_lower) #Not sure this is right or makes sense... but it is a Watts per Kelvin applied to each voxel
-         #          WAIT... since the delta T is dividing by these both, it will be smaller? where these are bigger? therefore where AREA is bigger?
-         #           Oh maybe but only by R2 where the CP voxel is by R3 and therefore smallest dtime is STILL at the center! 
+        sigG_vox = np.zeros_like(self.Cp_voxel)
+        sigG_vox[:-1] += self.k_upper[:-1]            # interface to the outer neighbour
+        sigG_vox[1:] += self.k_upper[:-1]             # interface to the inner neighbour
+        sigG_vox[-1] += self.k_upper[-1] * self.a_upper[-1]    # MISSING CONVECTION TERM, but Instead double counting Conduction at edge?
             
-        dt_C_SigG = self.Cp_voxel / (geoAlpha * sigG_vox) # Ratio J/W locally and divided by Geometric "Alpha" from literature? 
+        dt_C_SigG = self.Cp_voxel / (geoAlpha * sigG_vox) # Ratio J/W locally and divided by Geometric 01Alpha" from literature? 
         # CITE ANY SOURCE FOR THAT? -->>>>>
         
-        if dt_check < min(dt_C_SigG):
+        dt_RESULT = min(dt_C_SigG) / (1 + margin) 
+        self.dt_array = dt_C_SigG / (1 + margin) # TEMPORARY OUTPUT TO CHECK dtime Values??
+        
+        if dt_check > min(dt_C_SigG):
             warnings.warn( "dt is LARGER than Stability Limit per Euler/Fourier",
               category=RuntimeWarning, stacklevel=2)
-        elif dt_check <= (min(dt_C_SigG)/(1+margin)):
+        elif dt_check >= (min(dt_C_SigG)/(1+margin)):
             warnings.warn( "dt is Within MARGIN of theoretical Limit Eu/Bi/Fo",
               category=RuntimeWarning, stacklevel=2)
+            
+        # FINALLY, BOUND dtime in case of edge cases / escapes (and set warnings)
+        if dt_RESULT <= dt_min:
+            dt_RESULT = dt_min
+            warnings.warn("dt below minimum reasonable limit, reset to {} nanosec".format(
+                round(dt_min*10**6)), category=RuntimeWarning, stacklevel=2)
+        elif dt_RESULT >= dt_max:
+            dt_RESULT = dt_max
+            warnings.warn("dt above maximum reasonable limit, reset to {} nanosec".format(
+                round(dt_max*10**6)), category=RuntimeWarning, stacklevel=2)
                 
-        return min(dt_C_SigG) / (1 + margin)    
+        return dt_RESULT    
        
     
     def iterate(self, ConvectionWatts, dtime:float=10**-7, 
@@ -364,40 +383,30 @@ class SprayDroplet:
 # Generate Defaults
 theAir = InletAir()
 theSlurry = SlurryData()                
-theDryer = SprayDryer()
+theDryer = SprayDryer(dropR= 125*10**-6)
 
 #defaultDrop = SprayDroplet(theSlurry, theDryer, dR=10**-6)
 #defaultDrop.iterate(0)
-theDroplet = SprayDroplet(theSlurry, theDryer, dR=5*10**-6)
+theDroplet = SprayDroplet(theSlurry, theDryer, dR=1*10**-6)
                 
 #import plotly.express as px
 import matplotlib.pyplot as plt
 import time 
 #import plotly.graph_objects as go
 
-''' 
-
-FOR TEST, Pre-Calculate expected Energy (therefore Time) for droplet to dry.
-INSTEAD of just guessing as I edit dt and N_datapoints...
- * Q needed to dry (TECHNICALLY) is the heat to bring it to boil, boil it, and
-         raise to the final temperature... However more heat is needed since
-         the droplet will be hotter when the middle reaches T Final... 
- * Heat also 
-'''         
-
- 
-
-dt = 50*10**-9              # time in sec (Nanosec so long as *10**-9)
+dt = 100*10**-9             # Model Delta-Time in sec (Nanosec so long as *10**-9)
 #                           # For reference, Our Dyamic dt minimum limits 
                             #     WET @ h=1000:  2000 *10**-9?
-                            #       DRY Worst-Case? : 53 * 10**-9?
+                            #     DRY Worst-Case? : 53 * 10**-9?
 #N_Datapoints = 50*10**6     # millions of points. 
 t_drying = 0.25             # time in seconds
+t_DYNAMIC_Q = True 
+
+
 N_Datapoints = round(t_drying/dt)
-
-
 N_Readouts = 20
-t_Trigger_msec = round(1000*t_drying/N_Readouts) # milisecs to data log
+t_Trigger_step = t_drying / N_Readouts # milisecs to data log
+t_Trigger_next = 0
 t_max = dt*N_Datapoints 
 
 t_array = []
@@ -436,20 +445,19 @@ while theDroplet.Age < t_drying: # Fix to track Dynamic "TRUE" Timing!
         print ("Running {} loops... Should take {} min...".format(
             N_Datapoints, round((time_est)/60)))
         # NOTE: Still predicting RunTime from the time-steps used at the BEGINNING
-        
     else:
         pass
-    
     
     dTemp_outer = theAir.inletTemp - theDroplet.T_degC[-1]
     dQdt_convection = dTemp_outer * theAir.heatTransferH * theDroplet.a_upper[-1]
     
     #theDroplet.iterate(dQdt_convection, dt, dynamic_dt = True)
-    theDroplet.iterate(dQdt_convection, dt)
+    theDroplet.iterate(dQdt_convection, dt, dynamic_dt = t_DYNAMIC_Q)
     
     i=i+1
-    if round(theDroplet.Age*10**9) % (t_Trigger_msec*10**6) == 0 : 
-        # True where Age in mSec passes trigger time (also in mSec)
+    #if round(theDroplet.Age*10**9) % (t_Trigger_msec*10**6) == 0 : 
+    if theDroplet.Age > t_Trigger_next: 
+        t_Trigger_next += t_Trigger_step
             
         ax[0].plot(theDroplet.r_vals*10**6, theDroplet.T_degC)
         ax[1].plot(theDroplet.r_vals*10**6, theDroplet.solidsPct)
@@ -499,8 +507,6 @@ ax2[2].set_ylabel("H(Watts)")
 ax2[2].set_xlabel("Time(sec)")
 
         
-    
-
 """
 LIST OF FUNCTIONS TO BUILD
 
